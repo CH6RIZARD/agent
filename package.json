@@ -1,0 +1,13 @@
+{
+  "name": "claude-export",
+  "version": "1.0.0",
+  "description": "Export Claude.ai save project chats to markdown and docx",
+  "scripts": {
+    "export": "node scripts/export_save_project_and_bundle.js"
+  },
+  "dependencies": {
+    "docx": "^9.0.0",
+    "mammoth": "^1.6.0",
+    "playwright": "^1.40.0"
+  }
+}

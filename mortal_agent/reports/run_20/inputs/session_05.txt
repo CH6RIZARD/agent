@@ -1,0 +1,3 @@
+greetings
+are you autonomous?
+why?

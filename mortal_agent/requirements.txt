@@ -1,0 +1,8 @@
+# Mortal Agent Requirements
+# Core: canon, source_loader, and .env loading for API keys
+PyYAML>=6.0
+python-docx>=1.0.0
+python-dotenv>=1.0.0
+
+# Optional: For testing
+pytest>=7.0.0
