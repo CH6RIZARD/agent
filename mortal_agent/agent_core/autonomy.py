@@ -103,11 +103,13 @@ def _propose_autonomy_fetch(
     delta_t: float,
     life_kernel: Any,
     source_context: Optional[str] = None,
+    meaning_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     One-shot LLM decision: browse at will. Returns NET_FETCH or WEB_SEARCH proposal or None.
     Call only when hazard < 0.5 and interval since last fetch decision >= FETCH_DECISION_INTERVAL.
-    source_context (ideology/docs) can inform which URL or query to choose.
+    source_context (ideology/docs) and meaning_state (goal, hypotheses, tension) inform what to fetch or search.
+    When meaning_state is provided, curiosity from recent web search / fetch can trigger follow-up searches.
     """
     try:
         from .llm_router import generate_reply_routed
@@ -122,6 +124,17 @@ def _propose_autonomy_fetch(
     prompt = raw.replace("{{energy_normalized}}", f"{energy_norm:.2f}")
     prompt = prompt.replace("{{hazard_score}}", f"{life_state.hazard_score:.2f}")
     prompt = prompt.replace("{{delta_t_seconds}}", f"{delta_t:.0f}")
+    # Inject meaning_state so curiosity from web search / fetch can trigger more searches
+    meaning_context = ""
+    if meaning_state and isinstance(meaning_state, dict):
+        goal = (meaning_state.get("meaning_goal") or "discover_self").strip()[:120]
+        tension = float(meaning_state.get("meaning_tension", 0.0))
+        hs = list(meaning_state.get("meaning_hypotheses", []))[-5:]
+        parts = [f"Goal: {goal}", f"Tension: {tension:.2f}"]
+        if hs:
+            parts.append("Recent (from search/fetch/chat): " + "; ".join((str(h)[:80] for h in hs)))
+        meaning_context = "**Recent context (use this to choose follow-up search or fetch):**\n- " + "\n- ".join(parts) + "\n\n"
+    prompt = prompt.replace("{{meaning_context}}", meaning_context)
     system = "You output exactly one line: FETCH_URL: <url> or SEARCH_QUERY: <query> or NONE. No other text."
     reply, _ = generate_reply_routed(
         prompt, system, max_tokens=120, source_context=source_context,
@@ -397,7 +410,9 @@ def run_autonomy_tick(
             and (delta_t - last_fetch_tick) >= FETCH_DECISION_INTERVAL
             and life_kernel
         ):
-            fetch_proposal = _propose_autonomy_fetch(life_state, delta_t, life_kernel, source_context=source_context)
+            fetch_proposal = _propose_autonomy_fetch(
+                life_state, delta_t, life_kernel, source_context=source_context, meaning_state=meaning_state
+            )
             if fetch_proposal:
                 proposals.append(fetch_proposal)
                 if life_kernel:
@@ -547,7 +562,9 @@ def run_autonomy_tick(
                     last_intent_out = "explore"
                 elif action_type == "web_browse":
                     # One-shot browse decision: fetch or search (no interval gate; will kernel already chose to browse)
-                    fetch_proposal = _propose_autonomy_fetch(life_state, delta_t, life_kernel, source_context=source_context)
+                    fetch_proposal = _propose_autonomy_fetch(
+                        life_state, delta_t, life_kernel, source_context=source_context, meaning_state=meaning_state
+                    )
                     if fetch_proposal:
                         bt = fetch_proposal.get("action_type", "")
                         payload = fetch_proposal.get("payload") or {}

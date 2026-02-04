@@ -338,6 +338,7 @@ class MortalAgent:
         Outbound HTTP GET using system network (WiFi/ethernet). Wired on by default.
         Returns {"executed": True, "body": "..."} or {"executed": False, "error": "..."}.
         Updates meaning_hypotheses with structured extraction (title + snippet), not just first 120 chars.
+        Fetch body is never emitted to terminal/observer—only used internally for hypotheses and link queue.
         """
         if not self._identity.alive:
             return {"executed": False, "error": "agent_dead"}

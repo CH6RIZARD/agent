@@ -37,4 +37,6 @@ If you output NONE or invalid format, no browse action will occur.
 - hazard_score: {{hazard_score}}
 - delta_t_seconds: {{delta_t_seconds}}
 
+{{meaning_context}}
+
 Reply with exactly one line: `FETCH_URL: <url>` or `SEARCH_QUERY: <query>` or `NONE`.
