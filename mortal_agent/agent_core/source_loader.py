@@ -132,12 +132,17 @@ def load_memories(repo_root: Optional[Path] = None) -> str:
 
 
 def load_web_chats(repo_root: Optional[Path] = None) -> str:
-    """Load web chats as IDEOLOGY (beliefs/doctrine/style), not continuity memory."""
+    """Load web chats as IDEOLOGY (beliefs/doctrine/style), not continuity memory.
+    File order is shuffled each load via HolyRNG (same RNG as rest of agent)."""
     root = repo_root or _REPO_ROOT
     save_dir = root / "saved" / "claude_web_chats" / "save"
     if not save_dir.exists():
         return ""
-    md_files = sorted(save_dir.glob("*.md"), key=lambda x: x.name, reverse=True)
+    md_files = list(save_dir.glob("*.md"))
+    if md_files:
+        from .holy_rng import HolyRNG, seed_from_entropy
+        rng = HolyRNG(seed_from_entropy())
+        rng.shuffle(md_files)
     parts = []
     for f in md_files:
         t = load_markdown(f, MAX_WEB_CHAT_CHARS_PER_FILE)
