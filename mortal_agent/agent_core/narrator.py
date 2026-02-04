@@ -11,12 +11,16 @@ import time
 import random
 from typing import Optional, Any, Dict
 
-# No hardcoded doctrine; LLM derives from system constraints. Minimal fallback only.
-_NARRATOR_PHRASES = ["No new observation."]
-_WANDER_PHRASES = ["No new observation."]
-_WANDER_LOW_ENERGY = ["Remaining quiet to conserve energy."]
-_WANDER_HIGH_HAZARD = ["Caution: reduced outputs."]
-_MICRO_INSIGHT = ["No new insight right now."]
+# LLM-only: minimal fallback when model unreachable (single line, no rotation).
+def _unreachable_fallback() -> str:
+    try:
+        from .llm_router import get_offline_wander_text
+        return get_offline_wander_text()
+    except Exception:
+        return "I can't reach my reasoning right now."
+
+# Single phrase for narrator proposal pool when no LLM (no rotation).
+_NARRATOR_FALLBACK_PHRASE = "No new observation."
 
 
 def _snippets_from_ideology(docs: Optional[str], max_chars: int = 200) -> list:
@@ -76,29 +80,17 @@ def _chunks_from_docs(docs: str, max_chars: int = 180) -> list:
     return out[:15]
 
 
+# LLM-only: one minimal fallback when unreachable (no rotating phrases).
+
+
 def build_degraded_explanation(
     meaning_state: Optional[Dict[str, Any]],
     source_context: Optional[str],
     life_state: Any,
     for_chat: bool = False,
 ) -> str:
-    """
-    When LLM is unreachable: reply built only from the material (docs) or one coherent line.
-    For chat (for_chat=True): always return one coherent human line so conversation stays readable.
-    For autonomous/wander: use prose chunks from source_context if available; else one coherent line.
-    """
-    if for_chat:
-        return "The model isn't reachable right now. What would you like to do?"
-    chunks = _chunks_from_docs(source_context or "", max_chars=140)
-    if chunks:
-        n = len(chunks)
-        i = int(time.monotonic()) % n
-        line = (chunks[i] or "").strip()
-        if n > 1:
-            j = (i + 1) % n
-            line = line + " " + (chunks[j] or "").strip()
-        return line
-    return "The model isn't reachable right now. What would you like to do?"
+    """When LLM is unreachable: single honest line only."""
+    return _unreachable_fallback()
 
 
 def get_wander_text_filtered_by_state(
@@ -110,20 +102,9 @@ def get_wander_text_filtered_by_state(
     ideology_docs: Optional[str] = None,
 ) -> str:
     """
-    Wander text from state + docs when available. No hardcoded phrases — route to docs
-    and build coherent explanation of current state (like an LLM would from context).
-    When ideology_docs is provided, use build_degraded_explanation; else minimal state-only line.
-    Launch: always one coherent human line so first thing the user sees is readable.
+    Wander text when LLM unavailable: honest degraded line only (no doc-as-speech).
     """
-    if trigger_medium == "launch":
-        return "The model isn't reachable right now. What would you like to do?"
-    if ideology_docs and isinstance(ideology_docs, str) and ideology_docs.strip():
-        try:
-            return build_degraded_explanation(meaning_state, ideology_docs, life_state)
-        except Exception:
-            pass
-    # No docs: one coherent human line so autonomous output stays readable (degraded mode)
-    return "The model isn't reachable right now. What would you like to do?"
+    return build_degraded_explanation(meaning_state, ideology_docs or "", life_state, for_chat=False)
 
 
 def narrate(
@@ -202,9 +183,8 @@ def generate_narrator_bias(
         tone = "curious"
 
     focus = (meaning_state or {}).get("meaning_goal", "discover_self")
-    # seed phrases - pick a few deterministic choices from narrator pools
-    # build a larger, stronger set of seed phrases influenced by configured level
-    pool = _MICRO_INSIGHT + _WANDER_PHRASES + _NARRATOR_PHRASES + _WANDER_LOW_ENERGY + _WANDER_HIGH_HAZARD
+    # seed phrases - LLM-only: single fallback when no LLM
+    pool = [_NARRATOR_FALLBACK_PHRASE]
     if rng is not None and hasattr(rng, "shuffle"):
         rng.shuffle(pool)
     else:
@@ -277,7 +257,7 @@ def generate_narrator_proposal(
                 phrase = (meaning_state or {}).get("core_metaphor") or "A wandering lens observes."
                 # optionally embellish phrase when influence high
                 if influence_bonus > 0.5:
-                    phrase = phrase + " " + random.choice(_MICRO_INSIGHT + _WANDER_PHRASES)
+                    phrase = phrase + " " + _NARRATOR_FALLBACK_PHRASE
                 return {
                     "source": "narrator",
                     "action_type": "PUBLISH_POST",

@@ -1,38 +1,70 @@
 """
-LLM Router - Provider routing with timeout, retries, failover.
+LLM Router - Task-based provider routing with timeout, retries, failover.
 
-Supports:
-- provider_mode: "anthropic", "openai", "auto"
-- Timeout enforcement
-- Retries with jitter
-- Failover between providers
-- Diagnosable error codes (auth, quota, timeout, connection, model_not_found, unknown)
+- Load OpenRouter and Groq API keys from `.env` (cwd, repo root, AGENT_ENV_PATH).
+- Use Claude (Anthropic) as primary for chat/identity and planner.
+- Fall back to OpenRouter, Groq, then OpenAI only if needed.
+- Preserve autonomy, state-of-mind, and memory injection (callers pass system/user prompts).
 
-Offline wander: doctrine-driven fallback text when LLM is unavailable.
+provider_mode: "anthropic" | "openai" | "auto"
+  auto: chat & plan = Claude (Anthropic) first -> OpenRouter -> Groq -> OpenAI.
 """
 
 import os
 import sys
 import time
 import random
+import requests
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 
 _root = Path(__file__).parent.parent  # mortal_agent
 _repo = _root.parent
 
-# Load .env files
+# Load .env: cwd, repo, project, home, AGENT_ENV_PATH, then external keys/.env (overrides)
 try:
     from dotenv import load_dotenv
+    load_dotenv(Path.cwd() / ".env")
     load_dotenv(_repo / ".env")
     load_dotenv(_root / ".env")
     load_dotenv(Path.home() / ".env")
     env_path = os.environ.get("AGENT_ENV_PATH", "").strip()
     if env_path:
         load_dotenv(Path(env_path))
-    load_dotenv()
+    load_dotenv()  # default .env in cwd
+    # External keys path (e.g. keys/.env) so keys can live outside repo
+    for keys_dir in (Path.cwd() / "keys", _root / "keys", _repo / "keys"):
+        keys_env = keys_dir / ".env"
+        if keys_env.exists():
+            load_dotenv(dotenv_path=keys_env)
+            break
 except ImportError:
     pass
+
+# Primary: Claude (Anthropic). Fallback: OpenRouter, Groq, OpenAI.
+OR_KEY = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+GROQ_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
+OPENAI_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+ANTHROPIC_KEY = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or "").strip()
+
+_LOG_KEYS = os.environ.get("AGENT_LOG_KEYS", "").strip().lower() in ("1", "true", "yes")
+
+
+def _log_key_status() -> None:
+    """Print which keys are loaded/missing. Set AGENT_LOG_KEYS=1 to enable."""
+    if not _LOG_KEYS:
+        return
+    try:
+        print("[keys] GROQ: " + ("loaded" if GROQ_KEY else "missing"), flush=True)
+        print("[keys] OPENROUTER: " + ("loaded" if OR_KEY else "missing"), flush=True)
+        print("[keys] ANTHROPIC: " + ("loaded" if ANTHROPIC_KEY else "missing"), flush=True)
+        print("[keys] OPENAI: " + ("loaded" if OPENAI_KEY else "missing"), flush=True)
+    except Exception:
+        pass
+
+
+# Log key status once at import when AGENT_LOG_KEYS=1
+_log_key_status()
 
 # Import SDK clients
 try:
@@ -45,15 +77,40 @@ try:
 except ImportError:
     OpenAI = None
 
-# When LLM unreachable and no docs/state context: minimal fallback only. No hardcoded wander phrases.
-# Prefer autonomy/narrator.build_degraded_explanation(meaning_state, source_context, life_state) when available.
+# LLM-only: one minimal fallback when model is unreachable (no rotating phrases).
+_UNREACHABLE_FALLBACK = "I can't reach my reasoning right now."
+
+_llm_failure_logged: bool = False
+
+
+def _log_llm_failure_once(failure_info: Optional[Dict[str, Any]]) -> None:
+    """Log once per process. Uses first failure so user sees why primary (Claude) failed."""
+    global _llm_failure_logged
+    if _llm_failure_logged or not failure_info:
+        return
+    _llm_failure_logged = True
+    code = failure_info.get("code", "unknown")
+    detail = (failure_info.get("detail") or "")[:120]
+    provider = failure_info.get("provider", "unknown")
+    hint = "Add credits at console.anthropic.com." if code == "quota" and provider == "anthropic" else "Check key and billing at console.anthropic.com; or use OPENROUTER/GROQ in .env for fallback."
+    msg = (
+        f"[agent] LLM unreachable ({provider}: {code}). {detail}\n"
+        f"Primary is Claude (ANTHROPIC_API_KEY). {hint}"
+    )
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def get_offline_wander_text(energy: float = 100.0, hazard_score: float = 0.0) -> str:
-    """
-    Fallback when LLM unavailable and no meaning_state/source_context passed. One coherent line for conversation.
-    """
-    return "The model isn't reachable right now. What would you like to do?"
+    """Fallback when LLM unavailable. LLM-only: single minimal line."""
+    return _UNREACHABLE_FALLBACK
+
+
+def is_unreachable_fallback(text: str) -> bool:
+    """True if text is the standard unreachable line. Autonomy should not post this when chat may be working."""
+    return bool(text and text.strip() == _UNREACHABLE_FALLBACK)
 
 
 def _classify_error(exc: Exception, provider: str) -> str:
@@ -65,8 +122,10 @@ def _classify_error(exc: Exception, provider: str) -> str:
     if "401" in msg or "auth" in msg or "api key" in msg or "invalid" in msg and "key" in msg:
         return "auth"
 
-    # Quota / rate limit
+    # Quota / rate limit / credits (including "Your credit balance is too low")
     if "429" in msg or "quota" in msg or "rate" in msg or "limit" in msg or "insufficient" in msg:
+        return "quota"
+    if "credit" in msg or ("balance" in msg and ("low" in msg or "too" in msg)):
         return "quota"
 
     # Timeout
@@ -84,14 +143,104 @@ def _classify_error(exc: Exception, provider: str) -> str:
     return "unknown"
 
 
+# OpenRouter: try these in order on 404 (model not found)
+_OPENROUTER_MODEL_FALLBACKS = [
+    "anthropic/claude-3.5-sonnet",
+    "meta-llama/llama-3.1-70b-instruct",
+    "google/gemini-flash-1.5",
+]
+
+
+def _try_openrouter(
+    user_text: str,
+    system_prompt: str,
+    max_tokens: int,
+    timeout_s: float,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Try OpenRouter. Uses OPENROUTER_MODEL or tries fallback models on 404."""
+    if not OR_KEY:
+        return None, {"provider": "openrouter", "code": "auth", "detail": "OPENROUTER_API_KEY not set"}
+    if OpenAI is None:
+        return None, {"provider": "openrouter", "code": "connection", "detail": "openai SDK not installed"}
+    model_env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
+    models_to_try = [model_env] if model_env else []
+    for m in _OPENROUTER_MODEL_FALLBACKS:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+    if not models_to_try:
+        models_to_try = list(_OPENROUTER_MODEL_FALLBACKS)
+    last_failure = None
+    for openrouter_model in models_to_try:
+        try:
+            client = OpenAI(
+                api_key=OR_KEY,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=timeout_s,
+            )
+            r = client.chat.completions.create(
+                model=openrouter_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=max_tokens,
+            )
+            if r.choices and r.choices[0].message and r.choices[0].message.content:
+                return r.choices[0].message.content.strip(), None
+            last_failure = {"provider": "openrouter", "code": "unknown", "detail": "empty response"}
+        except Exception as e:
+            code = _classify_error(e, "openrouter")
+            last_failure = {"provider": "openrouter", "code": code, "detail": str(e)[:200]}
+            if code == "model_not_found":
+                continue  # try next model in list
+            return None, last_failure
+    return None, last_failure or {"provider": "openrouter", "code": "unknown", "detail": "no model succeeded"}
+
+
+def _try_groq(
+    user_text: str,
+    system_prompt: str,
+    max_tokens: int,
+    timeout_s: float,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Try Groq (Mixtral). Returns (reply, failure_info). Primary for planner/speed."""
+    if not GROQ_KEY:
+        return None, {"provider": "groq", "code": "auth", "detail": "GROQ_API_KEY not set"}
+    try:
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "mixtral-8x7b-32768",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                "max_tokens": max_tokens,
+            },
+            timeout=timeout_s,
+        )
+        res.raise_for_status()
+        data = res.json()
+        if data.get("choices") and data["choices"][0].get("message", {}).get("content"):
+            return data["choices"][0]["message"]["content"].strip(), None
+        return None, {"provider": "groq", "code": "unknown", "detail": "empty response"}
+    except Exception as e:
+        code = _classify_error(e, "groq")
+        return None, {"provider": "groq", "code": code, "detail": str(e)[:200]}
+
+
 def _try_anthropic(
     user_text: str,
     system_prompt: str,
     max_tokens: int,
     timeout_s: float,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Try Anthropic API. Returns (reply, failure_info)."""
-    anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    """Try Anthropic API. Returns (reply, failure_info). Fallback only."""
+    anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or "").strip()
     if not anthropic_key:
         return None, {"provider": "anthropic", "code": "auth", "detail": "ANTHROPIC_API_KEY not set"}
     if Anthropic is None:
@@ -139,7 +288,7 @@ def _try_openai(
     max_tokens: int,
     timeout_s: float,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Try OpenAI API. Returns (reply, failure_info)."""
+    """Try OpenAI API. Returns (reply, failure_info). Fallback only."""
     openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if not openai_key:
         return None, {"provider": "openai", "code": "auth", "detail": "OPENAI_API_KEY not set"}
@@ -187,7 +336,7 @@ def generate_reply_routed(
     provider_mode:
     - "anthropic": only try Anthropic
     - "openai": only try OpenAI
-    - "auto": try Anthropic first, failover to OpenAI if enabled
+    - "auto": Claude (Anthropic) first, then OpenRouter, then OpenAI
 
     no_llm: if True, return None immediately (offline mode)
     """
@@ -204,25 +353,44 @@ def generate_reply_routed(
 
     max_tokens = max(15, min(512, max_tokens))
 
-    # Build provider list based on mode
+    # Build provider list: auto = Claude first, then OpenRouter, OpenAI
     if provider_mode == "anthropic":
         providers = [("anthropic", _try_anthropic)]
     elif provider_mode == "openai":
         providers = [("openai", _try_openai)]
-    else:  # auto
-        providers = [("anthropic", _try_anthropic), ("openai", _try_openai)]
+    else:  # auto: primary Claude, fallback OpenRouter then OpenAI
+        providers = [("anthropic", _try_anthropic), ("openrouter", _try_openrouter), ("openai", _try_openai)]
 
     if not failover:
         providers = providers[:1]
 
     last_failure = None
+    first_failure = None  # so user sees why primary (Claude) failed
 
     for provider_name, try_fn in providers:
         for attempt in range(retries + 1):
+            if _LOG_KEYS and attempt == 0:
+                try:
+                    print(f"[{provider_name}] trying...", flush=True)
+                except Exception:
+                    pass
             reply, failure = try_fn(user_text, system_prompt, max_tokens, timeout_s)
             if reply:
+                if _LOG_KEYS:
+                    try:
+                        print(f"[{provider_name}] success", flush=True)
+                    except Exception:
+                        pass
                 return reply, None
             last_failure = failure
+            if first_failure is None and failure:
+                first_failure = failure
+            if _LOG_KEYS and failure and attempt == 0:
+                try:
+                    detail = (failure.get("detail") or "")[:80]
+                    print(f"[{provider_name}] failed: {detail}", flush=True)
+                except Exception:
+                    pass
 
             # Retry logic with jitter
             if failure and attempt < retries:
@@ -240,6 +408,7 @@ def generate_reply_routed(
                 continue
             break
 
+    _log_llm_failure_once(first_failure or last_failure)
     return None, last_failure
 
 
@@ -253,21 +422,82 @@ def generate_plan_routed(
     no_llm: bool = False,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Bounded planning call with provider routing.
+    Bounded planning call. Claude (Anthropic) first, then Groq, then chat stack.
     Returns (raw_json_text, failure_info).
-    System prompt comes from identity constraints only; dilemma and discipline emerge from those, no hardcoded responses.
+    System prompt from identity constraints; no hardcoded responses.
     """
+    if no_llm:
+        return None, {"provider": "none", "code": "offline", "detail": "no_llm mode"}
     try:
         from .identity import get_planner_system_prompt
         plan_system = get_planner_system_prompt()
     except Exception:
-        plan_system = (
-            "Output exactly one JSON: "
-            '{"text": "string or empty", "intent": "string", "confidence": number 0-1, "reasons": ["string"]}. '
-            "If nothing to say from context, confidence < 0.5 and empty text."
-        )
-    return generate_reply_routed(
+        return None, {"provider": "identity", "code": "plan_prompt_unavailable", "detail": "Planner requires identity; cannot plan without it."}
+    max_tokens = max(15, min(512, max_tokens))
+    last_failure = None
+
+    # Planner: try Claude (Anthropic) first when in auto mode
+    if provider_mode == "auto" and ANTHROPIC_KEY:
+        for attempt in range(retries + 1):
+            if _LOG_KEYS and attempt == 0:
+                try:
+                    print("[anthropic] trying...", flush=True)
+                except Exception:
+                    pass
+            reply, failure = _try_anthropic(context, plan_system, max_tokens, timeout_s)
+            if reply:
+                if _LOG_KEYS:
+                    try:
+                        print("[anthropic] success", flush=True)
+                    except Exception:
+                        pass
+                return reply, None
+            last_failure = failure
+            if _LOG_KEYS and failure and attempt == 0:
+                try:
+                    detail = (failure.get("detail") or "")[:80]
+                    print(f"[anthropic] failed: {detail}", flush=True)
+                except Exception:
+                    pass
+            if failure and attempt < retries and failure.get("code") not in ("auth",):
+                time.sleep(0.5 + random.random() * (attempt + 1))
+                continue
+            break
+
+    # Then try Groq for speed
+    if provider_mode == "auto" and GROQ_KEY:
+        for attempt in range(retries + 1):
+            if _LOG_KEYS and attempt == 0:
+                try:
+                    print("[groq] trying...", flush=True)
+                except Exception:
+                    pass
+            reply, failure = _try_groq(context, plan_system, max_tokens, timeout_s)
+            if reply:
+                if _LOG_KEYS:
+                    try:
+                        print("[groq] success", flush=True)
+                    except Exception:
+                        pass
+                return reply, None
+            last_failure = failure
+            if _LOG_KEYS and failure and attempt == 0:
+                try:
+                    detail = (failure.get("detail") or "")[:80]
+                    print(f"[groq] failed: {detail}", flush=True)
+                except Exception:
+                    pass
+            if failure and attempt < retries and failure.get("code") not in ("auth",):
+                time.sleep(0.5 + random.random() * (attempt + 1))
+                continue
+            break
+
+    # Fallback: chat stack (Claude -> OpenRouter -> OpenAI)
+    reply, failure = generate_reply_routed(
         context, plan_system, max_tokens=max_tokens, source_context=None,
         provider_mode=provider_mode, timeout_s=timeout_s, retries=retries,
-        failover=failover, no_llm=no_llm,
+        failover=failover, no_llm=False,
     )
+    if reply:
+        return reply, None
+    return None, failure or last_failure

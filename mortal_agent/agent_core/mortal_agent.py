@@ -120,6 +120,7 @@ class MortalAgent:
         # narrator tuning (RAM only)
         self._narrator_influence_level = max(0.0, min(1.0, float(narrator_influence_level)))
         self._allow_narrator_force = bool(allow_narrator_force)
+        # Shared "LLM reachable": when chat or plan succeeds, set this so autonomy doesn't say "I can't reason"
         # control whether the agent will spawn its own input() loop on start()
         self._start_internal_cli = bool(start_internal_cli)
 
@@ -171,12 +172,13 @@ class MortalAgent:
             "meaning_hypotheses": [],
             "meaning_progress": 0.0,
             "meaning_tension": 0.0,
-                "narrator_bias": {},
+            "narrator_bias": {},
             "mediums_seen": {"user": 0, "docs": 0, "net_fetch": 0, "system": 0},
             "last_medium": "",
             "core_metaphor": "",
             "axioms": [],
             "turn_count": 0,
+            "last_autonomous_message": "",  # STRUCTURAL: single source of truth for queryability (what?/why?)
         }
         # Recent chat turns for coherent multi-turn (RAM only; last 4 entries: [user, agent, user, agent])
         self._recent_chat: list = []
@@ -345,16 +347,38 @@ class MortalAgent:
             pass
         return res
 
-    # Persistent meaning state helpers
+    # Persistent meaning state helpers.
+    # STRUCTURAL: Loading prior run's state would spoof continuity; this instance is a new being.
+    # last_autonomous_message is NEVER loaded from disk (anti-spoof: only set by commit path).
     def _load_persistent_state(self) -> None:
         try:
+            from .identity import PERSISTENCE_LOAD_FORBIDDEN
+            if PERSISTENCE_LOAD_FORBIDDEN:
+                return  # Do not load; this process is a new being. Saving for logs/debug only.
             if self._state_path.exists():
                 with open(self._state_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                # Explicit allow-list; last_autonomous_message omitted—write only via record_last_autonomous_message.
                 with self._state_lock:
                     for k in ("meaning_goal", "meaning_questions", "meaning_hypotheses", "meaning_progress", "meaning_tension", "mediums_seen", "last_medium", "core_metaphor", "axioms", "turn_count", "narrator_bias", "last_medium_hint"):
                         if k in data:
                             self._meaning_state[k] = data[k]
+        except Exception:
+            pass
+
+    # SINGLE WRITE PATH for last_autonomous_message (anti-spoof). Only call after an autonomous post has been committed.
+    def record_last_autonomous_message(self, text: str) -> None:
+        """Set last_autonomous_message. Call only from the code path that committed an autonomous post (autonomy tick or launch)."""
+        if not text or not (text or "").strip():
+            return
+        try:
+            t = (text or "").strip()[:200]
+            with self._state_lock:
+                self._meaning_state["last_autonomous_message"] = t
+            try:
+                self._save_persistent_state()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -726,6 +750,9 @@ class MortalAgent:
                             state_parts.append("Recent questions: " + "; ".join((str(q)[:80] for q in qs)))
                         if hs:
                             state_parts.append("Recent hypotheses: " + "; ".join((str(h)[:80] for h in hs)))
+                        lam = (ms.get("last_autonomous_message") or "").strip()
+                        if lam:
+                            state_parts.append("Last thing you said on your own (if user says what?/why?, explain this): " + lam[:200])
                         state_summary = ". ".join(state_parts)[:500]
                         if state_summary:
                             system += "\n\n[Your current state of mind—use this to stay coherent and continuous: " + state_summary + "]"
@@ -775,37 +802,13 @@ class MortalAgent:
                 except Exception:
                     pass
 
-            # Fallback when LLM unreachable: human-sounding reply from state + docs (no telemetry dump)
+            # LLM-only: when unreachable use single minimal fallback (no rotating phrases)
             if not reply:
                 try:
-                    from .narrator import build_degraded_explanation
-                    life_state = self.get_life_state()
-                    reply = build_degraded_explanation(
-                        self._meaning_state,
-                        getattr(self, "_source_context", None) or "",
-                        life_state,
-                        for_chat=True,
-                    )
+                    from .llm_router import get_offline_wander_text
+                    reply = get_offline_wander_text()
                 except Exception:
                     reply = ""
-                if not (reply and reply.strip()):
-                    try:
-                        res = self.wander_step(trigger_medium="user")
-                        reply = res.get("text") or ""
-                    except Exception:
-                        reply = ""
-                if not (reply and reply.strip()):
-                    try:
-                        from .narrator import build_degraded_explanation
-                        reply = build_degraded_explanation(
-                            self._meaning_state,
-                            getattr(self, "_source_context", None) or "",
-                            self.get_life_state(),
-                            for_chat=False,
-                        )
-                    except Exception:
-                        reply = ""
-                # optional: tie to their message
                 try:
                     short = (message or "").strip()
                     if short and len(short) < 80 and reply:
@@ -834,7 +837,11 @@ class MortalAgent:
                     except Exception:
                         pass
                     if not (text_out and text_out.strip()):
-                        text_out = reply or "I heard you."
+                        try:
+                            from .llm_router import get_offline_wander_text
+                            text_out = reply or get_offline_wander_text()
+                        except Exception:
+                            text_out = reply or "I can't reach my reasoning right now."
                     emitted_reply = text_out
                     try:
                         try:
@@ -855,7 +862,12 @@ class MortalAgent:
                         if reply:
                             try:
                                 iid = (self._identity.instance_id or "agent")[:8]
-                                print(f"[{iid}] {reply or 'I heard you.'}", flush=True)
+                                try:
+                                    from .llm_router import get_offline_wander_text
+                                    print(f"[{iid}] {reply or get_offline_wander_text()}", flush=True)
+                                except Exception:
+                                    fallback = "I can't reach my reasoning right now."
+                                    print(f"[{iid}] {reply or fallback}", flush=True)
                             except Exception:
                                 pass
                 else:
@@ -933,7 +945,7 @@ class MortalAgent:
             pass
 
         # Wander on startup: narrator-filtered, self-executing. Runs on start (internal loop).
-        # Autonomous chosen outputs start and end with ...
+        # Record launch as last_autonomous_message only after post is committed (single write path).
         try:
             from .autonomy import _wrap_autonomous_text
             res = self.wander_step(trigger_medium="launch")
@@ -941,9 +953,11 @@ class MortalAgent:
                 launch_text = _wrap_autonomous_text((res["text"] or "").strip())
                 if launch_text:
                     self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, launch_text, ["launch"]))
-                self._executor.execute(self._identity.instance_id, [
+                exec_result = self._executor.execute(self._identity.instance_id, [
                     {"action": "PUBLISH_POST", "args": {"text": launch_text, "channel": "moltbook"}},
                 ])
+                if exec_result.get("published", 0) > 0 and (res.get("text") or "").strip():
+                    self.record_last_autonomous_message((res["text"] or "").strip()[:200])
         except Exception:
             pass
         # Health-check autonomy; start autonomous planner only if ok
@@ -1006,18 +1020,15 @@ class MortalAgent:
 
         def _apply_state_update(payload: dict) -> None:
             try:
-                # merge allowed keys into meaning_state and persist
+                # merge allowed keys into meaning_state and persist. last_autonomous_message is NOT accepted here (single write path only).
                 with self._state_lock:
                     for k, v in (payload or {}).items():
-                        # only accept updates to known keys to avoid arbitrary writes
                         if k in ("meaning_goal", "core_metaphor", "axioms", "last_medium_hint"):
                             self._meaning_state[k] = v
-                        # append autonomous thought to hypotheses (consciousness lock-in)
                         if k == "meaning_hypotheses_append" and v and isinstance(v, str):
                             hs = self._meaning_state.get("meaning_hypotheses", [])
                             hs.append(v[:200])
                             self._meaning_state["meaning_hypotheses"] = hs[-20:]
-                    # refresh narrator_bias if present
                     if "narrator_bias" in (payload or {}):
                         self._meaning_state["narrator_bias"] = (payload or {}).get("narrator_bias")
                 try:
@@ -1117,11 +1128,11 @@ class MortalAgent:
                 life_kernel=self._life_kernel,
                 observer_emit=self._emit,
                 state_update_fn=_apply_state_update,
+                record_last_autonomous_message_fn=self.record_last_autonomous_message,
                 no_llm=self._no_llm,
                 meaning_state=self._meaning_state,
                 narrator_influence_level=self._narrator_influence_level,
                 allow_narrator_force=self._allow_narrator_force,
-                # Survival-aware parameters (new)
                 birth_tick=self._identity.birth_tick,
                 death_at=getattr(self, "_death_at", None),
             )

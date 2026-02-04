@@ -42,28 +42,15 @@ ALLOWED_META_TRIGGERS = [
     "how do you function",
 ]
 
-# Identity / who-are-you: no hardcoded answer. Agent chooses and expresses identity through LLM (embedded stakes, system environment).
+# LLM-only: no hardcoded answers. All replies come from the LLM (identity/system prompt).
+# Triggers kept for optional analytics; do not substitute replies.
 
-# Greetings
 GREETING_TRIGGERS = ["hello", "hi ", " hi", "hey ", " hey", "hiya", "greetings"]
-GREETING_ANSWER = "Hello."
-
-# "How are you" -> short in-world
 HOW_ARE_YOU_TRIGGERS = ["how are you", "how are u", "how r u", "how do you feel"]
-HOW_ARE_YOU_ANSWER = "Running. Gate open."
-
-# "Ok" / "Okay" -> short acknowledgment so we don't just say "I'm here."
 OKAY_TRIGGERS = ["okay", " ok", "ok ", "k ", " alright", "alright "]
-OKAY_ANSWER = "Okay. Go on."
-
-TASK_FORWARD_REPLACE = None  # Disabled - let LLM response through
-
-# Capability questions (internet, autonomy, what can you do, etc.) are NOT hardcoded here.
-# They are answered by the LLM from the identity/capabilities in the system prompt.
-
-# "Why are you saying that / why acknowledged" -> short explanation so we keep speaking
 WHY_SAYING_THAT_TRIGGERS = ["why are you saying", "why are you say", "why acknowledged", "why that", "why did you say"]
-WHY_SAYING_THAT_ANSWER = "If you saw a short line, the policy keeps replies in-world and compact. Ask again or rephrase and I'll answer."
+
+TASK_FORWARD_REPLACE = None  # LLM-only: let LLM response through
 
 MAX_RECENT_CONSTRAINTS = 12
 RECENT_TURNS_N = 12

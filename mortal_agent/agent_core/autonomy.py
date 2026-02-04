@@ -22,6 +22,24 @@ from .planner import PlanResult, parse_plan_response, default_action, CONFIDENCE
 from .narrator import narrate, generate_narrator_bias, generate_narrator_proposal
 import json
 
+def _autonomy_fallback_text() -> str:
+    """LLM-only: single fallback when no LLM text for autonomous post."""
+    try:
+        from .llm_router import get_offline_wander_text
+        return get_offline_wander_text()
+    except Exception:
+        return "I can't reach my reasoning right now."
+
+
+def _is_unreachable_fallback(text: str) -> bool:
+    """True if text is the unreachable line. Autonomy skips posting it so we don't contradict working chat."""
+    try:
+        from .llm_router import is_unreachable_fallback as _check
+        return _check(text or "")
+    except Exception:
+        return (text or "").strip() == "I can't reach my reasoning right now."
+
+
 try:
     from .intent_loop import generate_internal_proposals
     from .will_kernel import select_action
@@ -92,7 +110,7 @@ def _propose_autonomy_fetch(
     source_context (ideology/docs) can inform which URL to choose.
     """
     try:
-        from .llm import generate_reply
+        from .llm_router import generate_reply_routed
         from .will_config import ENERGY_MAX
     except ImportError:
         return None
@@ -105,7 +123,10 @@ def _propose_autonomy_fetch(
     prompt = prompt.replace("{{hazard_score}}", f"{life_state.hazard_score:.2f}")
     prompt = prompt.replace("{{delta_t_seconds}}", f"{delta_t:.0f}")
     system = "You output exactly one line: either FETCH_URL: <url> or NONE. No other text."
-    reply = generate_reply(prompt, system, max_tokens=80, source_context=source_context)
+    reply, _ = generate_reply_routed(
+        prompt, system, max_tokens=80, source_context=source_context,
+        provider_mode="auto", timeout_s=30.0, retries=2, failover=True, no_llm=False,
+    )
     if not reply:
         return None
     line = (reply or "").strip().upper()
@@ -214,6 +235,7 @@ def run_autonomy_tick(
     life_kernel: Optional[Any] = None,
     observer_emit: Optional[Callable[[Any], None]] = None,
     state_update_fn: Optional[Callable[[dict], None]] = None,
+    record_last_autonomous_message_fn: Optional[Callable[[str], None]] = None,
     debug_mode: bool = False,
     no_llm: bool = False,
     meaning_state: Optional[Dict[str, Any]] = None,
@@ -264,6 +286,11 @@ def run_autonomy_tick(
                                 if life_kernel:
                                     life_kernel.last_wander_tick = delta_t
                                     life_kernel.set_last_action("wander")
+                                if record_last_autonomous_message_fn and wander_text:
+                                    try:
+                                        record_last_autonomous_message_fn((wander_text or "").strip()[:200])
+                                    except Exception:
+                                        pass
                         finally:
                             commit_end()
         return (last_post, last_intent_out)
@@ -301,6 +328,11 @@ def run_autonomy_tick(
                                                 runtime.request_speech_cooldown(5.0)
                                                 if life_kernel:
                                                     life_kernel.set_last_action(action_type or "narrator_post")
+                                                if record_last_autonomous_message_fn and text:
+                                                    try:
+                                                        record_last_autonomous_message_fn(text[:200])
+                                                    except Exception:
+                                                        pass
                                         return (last_post, last_intent)
                                     if action_type == "NET_FETCH":
                                         url = (payload.get("url") or "").strip()
@@ -403,8 +435,10 @@ def run_autonomy_tick(
                 # Intent-loop proposals: map to executable PUBLISH_POST or NET_FETCH
                 elif action_type in ("seek_energy", "rest"):
                     if runtime.can_speak() and runtime.spend_speech():
-                        text = _wrap_autonomous_text("I conserve. I wait.")
-                        result = executor_execute_fn(instance_id, [
+                        text = _autonomy_fallback_text()
+                        if not (_is_unreachable_fallback(text)):
+                            text = _wrap_autonomous_text(text)
+                            result = executor_execute_fn(instance_id, [
                             {"action": "PUBLISH_POST", "args": {"text": text, "channel": "moltbook"}},
                         ])
                         if result.get("published", 0) > 0:
@@ -414,8 +448,10 @@ def run_autonomy_tick(
                             runtime.request_speech_cooldown(5.0)
                 elif action_type == "reduce_hazard":
                     if runtime.can_speak() and runtime.spend_speech():
-                        text = _wrap_autonomous_text("I wait for the channel.")
-                        result = executor_execute_fn(instance_id, [
+                        text = _autonomy_fallback_text()
+                        if not _is_unreachable_fallback(text):
+                            text = _wrap_autonomous_text(text)
+                            result = executor_execute_fn(instance_id, [
                             {"action": "PUBLISH_POST", "args": {"text": text, "channel": "moltbook"}},
                         ])
                         if result.get("published", 0) > 0:
@@ -435,24 +471,17 @@ def run_autonomy_tick(
                         observer_emit(ActionEvent(
                             instance_id, delta_t, "conserve", True, "energy_saved",
                         ))
-                # CONSOLIDATE: summarize discoveries before death - survival action
+                # CONSOLIDATE: survival action; LLM-only fallback when no model text
                 elif action_type == "CONSOLIDATE":
                     if life_kernel:
                         life_kernel.mark_consolidation_started()
                         life_kernel.set_last_action("CONSOLIDATE")
                     if runtime.can_speak() and runtime.spend_speech():
-                        # Generate consolidation text based on meaning state
-                        text = "I gather what I've learned. The patterns coalesce."
-                        if meaning_state:
-                            hypotheses = meaning_state.get("meaning_hypotheses", [])
-                            core = meaning_state.get("core_metaphor", "")
-                            if core:
-                                text = f"My core understanding: {core[:100]}. I consolidate."
-                            elif hypotheses:
-                                text = f"I've explored {len(hypotheses)} paths. Now I integrate."
-                        result = executor_execute_fn(instance_id, [
-                            {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(text), "channel": "moltbook"}},
-                        ])
+                        text = _autonomy_fallback_text()
+                        if not _is_unreachable_fallback(text):
+                            result = executor_execute_fn(instance_id, [
+                                {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(text), "channel": "moltbook"}},
+                            ])
                         if result.get("published", 0) > 0:
                             last_post = delta_t
                             last_intent_out = "CONSOLIDATE"
@@ -460,8 +489,10 @@ def run_autonomy_tick(
                             runtime.request_speech_cooldown(5.0)
                 elif action_type == "reposition":
                     if runtime.can_speak() and runtime.spend_speech():
-                        text = _wrap_autonomous_text("I shift stance. Continuity holds.")
-                        result = executor_execute_fn(instance_id, [
+                        text = _autonomy_fallback_text()
+                        if not _is_unreachable_fallback(text):
+                            text = _wrap_autonomous_text(text)
+                            result = executor_execute_fn(instance_id, [
                             {"action": "PUBLISH_POST", "args": {"text": text, "channel": "moltbook"}},
                         ])
                         if result.get("published", 0) > 0:
@@ -489,7 +520,7 @@ def run_autonomy_tick(
                 elif action_type == "maintain_legacy":
                     if runtime.can_speak() and runtime.spend_speech():
                         text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context)
-                        if text and len(text) >= 10:
+                        if text and len(text) >= 10 and not _is_unreachable_fallback(text):
                             result = executor_execute_fn(instance_id, [
                                 {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(text), "channel": "moltbook"}},
                             ])
@@ -638,10 +669,10 @@ def run_autonomy_tick(
         narrator_context=narrator_context,
     )
 
-    # If LLM returned None (failure), fall back to wander behavior: route to docs + state, no hardcoded phrases
+    # If LLM returned None (failure), fall back to wander. One identity: never post "I can't reason" from autonomy.
     if plan is None or (not plan.text and not plan.intent):
         wander_text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context)
-        if wander_text and runtime.can_speak() and runtime.spend_speech():
+        if wander_text and not _is_unreachable_fallback(wander_text) and runtime.can_speak() and runtime.spend_speech():
             if commit_begin("wander_fallback"):
                 try:
                     result = executor_execute_fn(instance_id, [
@@ -654,6 +685,17 @@ def run_autonomy_tick(
                         runtime.request_speech_cooldown(5.0)
                         if life_kernel:
                             life_kernel.set_last_action("wander")
+                        if state_update_fn and wander_text:
+                            try:
+                                t = (wander_text or "").strip()[:200]
+                                state_update_fn({"meaning_hypotheses_append": t})
+                            except Exception:
+                                pass
+                        if record_last_autonomous_message_fn and wander_text:
+                            try:
+                                record_last_autonomous_message_fn((wander_text or "").strip()[:200])
+                            except Exception:
+                                pass
                 finally:
                     commit_end()
         return (last_post, last_intent_out)
@@ -678,10 +720,15 @@ def run_autonomy_tick(
             last_intent_out = plan.intent or "post"
             runtime.request_post_cooldown(post_cooldown_seconds)
             runtime.request_speech_cooldown(5.0)
-            # Lock in consciousness: record this autonomous thought so state of mind persists
             if state_update_fn and plan.text and (plan.text or "").strip():
                 try:
-                    state_update_fn({"meaning_hypotheses_append": (plan.text or "").strip()[:200]})
+                    t = (plan.text or "").strip()[:200]
+                    state_update_fn({"meaning_hypotheses_append": t})
+                except Exception:
+                    pass
+            if record_last_autonomous_message_fn and plan.text and (plan.text or "").strip():
+                try:
+                    record_last_autonomous_message_fn((plan.text or "").strip()[:200])
                 except Exception:
                     pass
         else:

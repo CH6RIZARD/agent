@@ -31,15 +31,21 @@ DOCTRINE_ANCHORS = [
 # Archetypes: rotate; never repeat same type twice in a row
 ARCHETYPES = ["VOW", "CONFLICT", "INTENT", "OBSERVATION", "QUESTION"]
 
-# No hardcoded doctrine; LLM derives expression from system constraints. Minimal fallback only (≥MIN_CHARS, one anchor).
-_MIN_FALLBACK = "I have nothing new and will remain quiet unless there's a clear, relevant prompt."
-# Use minimal, neutral fallbacks that avoid motto-like phrasing.
-DOCTRINE_VOW = [_MIN_FALLBACK]
-DOCTRINE_CONFLICT = [_MIN_FALLBACK]
-DOCTRINE_INTENT = [_MIN_FALLBACK]
-DOCTRINE_OBSERVATION = [_MIN_FALLBACK]
-DOCTRINE_QUESTION = [_MIN_FALLBACK]
-NARRATOR_PHRASES = ["Briefly: no new observation."]
+# LLM-only: single minimal fallback when model unreachable (no rotation).
+def _textforge_fallback() -> str:
+    try:
+        from .llm_router import get_offline_wander_text
+        return get_offline_wander_text()
+    except Exception:
+        return "I can't reach my reasoning right now."
+
+_FALLBACK_STR = _textforge_fallback()
+DOCTRINE_VOW = [_FALLBACK_STR]
+DOCTRINE_CONFLICT = [_FALLBACK_STR]
+DOCTRINE_INTENT = [_FALLBACK_STR]
+DOCTRINE_OBSERVATION = [_FALLBACK_STR]
+DOCTRINE_QUESTION = [_FALLBACK_STR]
+NARRATOR_PHRASES = [_FALLBACK_STR]
 
 
 def _trigrams(text: str) -> set:

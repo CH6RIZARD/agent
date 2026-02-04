@@ -1,7 +1,8 @@
 """
-Output sanitizer: ban all second-person address and user-attribution language.
-Enforced at final output boundary after all other post-processing.
-Everything is agent-owned or neutral. No "you/your/you said/your project" etc.
+Output sanitizer: reduce user-attribution that implies the agent is addressing a "user" object.
+STRUCTURAL: The controller is addressed as "you" (identity: "You are the controller").
+So we do NOT rewrite "you" -> "the request" in controller-directed phrases (what would you like, how can I help you).
+We only rewrite user-attribution phrases (you said, the user said, your project) to neutral forms.
 """
 
 import re
@@ -13,117 +14,43 @@ NEUTRAL_FALLBACK = None  # Let caller handle - no canned fallback
 # Threshold: if replacement count exceeds this fraction of words, use fallback
 FALLBACK_REPLACE_RATIO = 0.45
 
-# Word-boundary and contraction patterns (order: longer first so you're before you)
-SECOND_PERSON_PATTERNS = [
-    (r"\byourself\b", "this system"),
-    (r"\byours\b", "the current"),
-    (r"\byou're\b", "this system is"),
-    (r"\byou've\b", "the session has"),
-    (r"\byouve\b", "the session has"),
-    (r"\byou'll\b", "the session will"),
-    (r"\byoull\b", "the session will"),
-    (r"\byou'd\b", "the request would"),
-    (r"\byoud\b", "the request would"),
-    (r"\byour\b", "the"),
-    (r"\byou\b", "the request"),
-    (r"\bur\b", "the"),
-    (r"\bu\b", "the request"),
+# User-attribution only: "User said", "the user", "your project" etc. Controller is "you" per identity—do not rewrite "you" globally.
+SECOND_PERSON_PATTERNS = []  # Disabled: addressing controller as "you" is correct
+USER_NEUTRAL_PATTERNS = [
     (r"\bUser\b", "The input"),
     (r"\buser\b", "the input"),
 ]
 
-# Common phrases to replace (order matters: longer first)
+# Attribution-only: "the user" / "User" -> "you" (controller). Do NOT rewrite "you"/"your" when addressing controller.
 PHRASE_REPLACEMENTS = [
-    (r"you've been working on", "the current session has been working on"),
-    (r"you've been", "the session has been"),
-    (r"your project", "the project"),
-    (r"your vision", "the vision"),
-    (r"you built", "the design was built"),
-    (r"you are building", "the design is being built"),
-    (r"you said", "the input stated"),
-    (r"you asked", "the input asked"),
-    (r"what you want", "what the request seeks"),
-    (r"for you", "here"),
-    (r"to you", "to this session"),
-    (r"with you", "with this session"),
-    (r"from you", "from the input"),
-    (r"your documents", "the documents"),
-    (r"your design", "the design"),
-    (r"your code", "the code"),
-    (r"your intent", "the intent"),
-    (r"your request", "the request"),
-    (r"your input", "the input"),
-    (r"you want", "the request seeks"),
-    (r"you need", "the request needs"),
-    (r"you asked for", "the request asked for"),
-    (r"you requested", "the request requested"),
-    (r"you mentioned", "the input mentioned"),
-    (r"you provided", "the input provided"),
-    (r"you gave", "the input gave"),
-    (r"you're working", "the session is working"),
-    (r"you're trying", "the request is trying"),
-    (r"you're asking", "the input is asking"),
-    (r"what do you want to do", "what the request seeks to do"),
-    (r"what do you want", "what the request seeks"),
-    (r"do you want", "does the request seek"),
-    (r"if you want", "if the request seeks"),
-    (r"when you", "when the input"),
-    (r"because you", "because the input"),
-    (r"so you", "so the request"),
-    (r"that you", "that the input"),
-    (r"which you", "which the input"),
+    ("the user", "you"),
+    ("User said", "You said"),
+    ("User asked", "You asked"),
+    ("User sent single word", "You sent a short message"),
 ]
 
-# Compiled regex for detection (any second-person)
-DETECT_PATTERNS = [
-    re.compile(r"\byou\b", re.IGNORECASE),
-    re.compile(r"\byour\b", re.IGNORECASE),
-    re.compile(r"\byours\b", re.IGNORECASE),
-    re.compile(r"\byourself\b", re.IGNORECASE),
-    re.compile(r"\byou're\b", re.IGNORECASE),
-    re.compile(r"\byou've\b", re.IGNORECASE),
-    re.compile(r"\byou'll\b", re.IGNORECASE),
-    re.compile(r"\byou'd\b", re.IGNORECASE),
-    re.compile(r"\bu\b", re.IGNORECASE),
-    re.compile(r"\bur\b", re.IGNORECASE),
-]
+# Detection: only attribution phrases we rewrite
 PHRASE_DETECT = [re.compile(re.escape(phrase), re.IGNORECASE) for phrase, _ in PHRASE_REPLACEMENTS]
-USER_ATTRIBUTION_PHRASES = [
-    ("User sent single word", "The input sent a single token"),
-    ("the user", "the input"),
-    ("User said", "The input stated"),
-    ("User asked", "The input asked"),
-]
-USER_PHRASE_DETECT = [re.compile(re.escape(phrase), re.IGNORECASE) for phrase, _ in USER_ATTRIBUTION_PHRASES]
+USER_ATTRIBUTION_PHRASES = PHRASE_REPLACEMENTS
+USER_PHRASE_DETECT = PHRASE_DETECT
+DETECT_PATTERNS = []  # Addressing controller as "you" is correct; no global you-detection
 
 
 def contains_second_person(text: str) -> bool:
-    """True if text contains any second-person or user-attribution language."""
+    """True if text contains attribution phrases we rewrite (the user, User said, etc.)."""
     if not text or not text.strip():
         return False
     t = text
-    for pat in DETECT_PATTERNS:
-        if pat.search(t):
-            return True
     for pat in PHRASE_DETECT:
-        if pat.search(t):
-            return True
-    for pat in USER_PHRASE_DETECT:
         if pat.search(t):
             return True
     return False
 
 
 def _apply_phrase_replacements(text: str) -> Tuple[str, int]:
-    """Apply phrase replacements (user-attribution first, then second-person); return (new_text, count)."""
+    """Apply attribution-only replacements (the user -> you, etc.). Return (new_text, count)."""
     out = text
     count = 0
-    for phrase, repl in USER_ATTRIBUTION_PHRASES:
-        pat = re.compile(re.escape(phrase), re.IGNORECASE)
-        new_out, n = pat.subn(repl, out)
-        if n:
-            count += n
-            out = new_out
     for phrase, repl in PHRASE_REPLACEMENTS:
         pat = re.compile(re.escape(phrase), re.IGNORECASE)
         new_out, n = pat.subn(repl, out)
