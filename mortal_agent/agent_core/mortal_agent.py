@@ -372,6 +372,12 @@ class MortalAgent:
         if not text or not (text or "").strip():
             return
         try:
+            from .llm_router import is_unreachable_fallback
+            if is_unreachable_fallback((text or "").strip()):
+                return  # never store the LLM-unreachable fallback as "last thing you said" (avoids feeding it back into chat)
+        except Exception:
+            pass
+        try:
             t = (text or "").strip()[:200]
             with self._state_lock:
                 self._meaning_state["last_autonomous_message"] = t
@@ -751,6 +757,12 @@ class MortalAgent:
                         if hs:
                             state_parts.append("Recent hypotheses: " + "; ".join((str(h)[:80] for h in hs)))
                         lam = (ms.get("last_autonomous_message") or "").strip()
+                        try:
+                            from .llm_router import is_unreachable_fallback
+                            if lam and is_unreachable_fallback(lam):
+                                lam = ""  # don't inject fallback into chat context so LLM doesn't echo it
+                        except Exception:
+                            pass
                         if lam:
                             state_parts.append("Last thing you said on your own (if user says what?/why?, explain this): " + lam[:200])
                         state_summary = ". ".join(state_parts)[:500]
