@@ -34,7 +34,7 @@ from .identity import Identity
 from .embodied_gate import EmbodiedGate, GateStatus, GateFailureCause
 from .events import BirthEvent, HeartbeatEvent, PageEvent, EndedEvent, BaseEvent, TelemetryEvent
 from .canon import load_canon
-from .executor import Executor, ACTION_NET_FETCH
+from .executor import Executor, ACTION_NET_FETCH, ACTION_WEB_SEARCH
 from .runtime_state import RuntimeState
 from .autonomy import run_autonomy_tick
 from .planner import parse_plan_response, PlanResult
@@ -46,16 +46,20 @@ from .holy_rng import HolyRNG, seed_from_entropy
 
 
 def _default_network_pipeline():
-    """Use system network (WiFi/ethernet) for NET_FETCH. Wired on by default."""
+    """Use system network (WiFi/ethernet) for NET_FETCH + WEB_SEARCH. Wired on by default."""
     try:
         import sys
         _mortal_root = Path(__file__).resolve().parent.parent
         if str(_mortal_root) not in sys.path:
             sys.path.insert(0, str(_mortal_root))
-        from network_pipeline import simple_http_fetch_pipeline
-        return simple_http_fetch_pipeline
+        from network_pipeline import unified_network_pipeline
+        return unified_network_pipeline
     except ImportError:
-        return None
+        try:
+            from network_pipeline import simple_http_fetch_pipeline
+            return simple_http_fetch_pipeline
+        except ImportError:
+            return None
 
 
 def _ensure_network_connected(network_pipeline: Optional[Any]) -> None:
@@ -137,9 +141,18 @@ class MortalAgent:
 
         # Canon + Executor with network pipeline (WiFi/ethernet) required
         canon = load_canon()
-        network_pipeline = _default_network_pipeline()
+        _base_pipeline = _default_network_pipeline()
         if require_network:
-            _ensure_network_connected(network_pipeline)
+            _ensure_network_connected(_base_pipeline)
+
+        def _pipeline_with_ingest(item: Dict, instance_id: str) -> Dict:
+            r = _base_pipeline(item, instance_id) if _base_pipeline else {"executed": False, "error": "no_pipeline"}
+            if item.get("action") == "WEB_SEARCH" and r.get("executed") and instance_id == self._identity.instance_id:
+                try:
+                    self._ingest_search_result(r)
+                except Exception:
+                    pass
+            return r
 
         def post_callback(instance_id: str, text: str, metadata: Dict, channel: str) -> None:
             self.emit_page(text, tags=[channel])
@@ -147,7 +160,7 @@ class MortalAgent:
         self._executor = Executor(
             canon=canon,
             post_callback=post_callback,
-            run_network_pipeline=network_pipeline,
+            run_network_pipeline=_pipeline_with_ingest,
         )
         self._runtime_state = RuntimeState()
         self._life_kernel = LifeKernel()
@@ -345,6 +358,49 @@ class MortalAgent:
                             self._meaning_state["meaning_hypotheses"] = hs
         except Exception:
             pass
+        return res
+
+    def _ingest_search_result(self, res: Dict[str, Any]) -> None:
+        """Ingest WEB_SEARCH result into meaning_hypotheses and autonomy URL queue (follow links)."""
+        if not isinstance(res, dict) or not res.get("executed"):
+            return
+        try:
+            self.record_medium("web_search")
+        except Exception:
+            pass
+        with self._state_lock:
+            hs = self._meaning_state.get("meaning_hypotheses", [])
+            if len(hs) < 15:
+                abstract = (res.get("abstract") or "").strip()
+                if abstract:
+                    hs.append("search: " + abstract[:400])
+                for s in (res.get("snippets") or [])[:5]:
+                    if isinstance(s, str) and s.strip() and len(hs) < 15:
+                        hs.append("search: " + s[:300].strip())
+            self._meaning_state["meaning_hypotheses"] = hs
+        urls = res.get("urls") or []
+        if urls:
+            with self._autonomy_lock:
+                for u in urls[:10]:
+                    if isinstance(u, str) and u.startswith(("http://", "https://")) and u not in self._autonomy_url_queue:
+                        if len(self._autonomy_url_queue) < 20:
+                            self._autonomy_url_queue.append(u)
+
+    def web_search(self, query: str) -> Dict[str, Any]:
+        """
+        Run a web search (WEB_SEARCH). Updates meaning_hypotheses and autonomy URL queue from results.
+        Returns {"executed": True, "query", "abstract", "snippets", "urls"} or {"executed": False, "error": "..."}.
+        """
+        if not self._identity.alive:
+            return {"executed": False, "error": "agent_dead"}
+        query = (query or "").strip()[:500]
+        if not query:
+            return {"executed": False, "error": "empty_query"}
+        item = {"action": ACTION_WEB_SEARCH, "args": {"query": query}}
+        pipeline = getattr(self._executor, "_run_network_pipeline", None)
+        if not pipeline:
+            return {"executed": False, "error": "network_pipeline_not_available"}
+        res = pipeline(item, self._identity.instance_id)
         return res
 
     # Persistent meaning state helpers.

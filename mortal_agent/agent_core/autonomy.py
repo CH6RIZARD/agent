@@ -85,7 +85,7 @@ except ImportError:
 AUTONOMY_TICK_INTERVAL = 2.0
 POST_COOLDOWN_SECONDS = 30.0
 INITIATIVE_MIN_INTERVAL = 60.0
-FETCH_DECISION_INTERVAL = 90.0  # seconds between autonomy fetch decisions
+FETCH_DECISION_INTERVAL = 35.0  # seconds between autonomy browse decisions (fetch or search)
 WANDER_INTERVAL = 45.0  # seconds between offline wander posts
 
 _AUTONOMY_FETCH_PROMPT_PATH = Path(__file__).resolve().parent.parent / "templates" / "autonomy_fetch.md"
@@ -105,9 +105,9 @@ def _propose_autonomy_fetch(
     source_context: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    One-shot LLM decision: fetch at will. Returns NET_FETCH proposal or None.
+    One-shot LLM decision: browse at will. Returns NET_FETCH or WEB_SEARCH proposal or None.
     Call only when hazard < 0.5 and interval since last fetch decision >= FETCH_DECISION_INTERVAL.
-    source_context (ideology/docs) can inform which URL to choose.
+    source_context (ideology/docs) can inform which URL or query to choose.
     """
     try:
         from .llm_router import generate_reply_routed
@@ -122,9 +122,9 @@ def _propose_autonomy_fetch(
     prompt = raw.replace("{{energy_normalized}}", f"{energy_norm:.2f}")
     prompt = prompt.replace("{{hazard_score}}", f"{life_state.hazard_score:.2f}")
     prompt = prompt.replace("{{delta_t_seconds}}", f"{delta_t:.0f}")
-    system = "You output exactly one line: either FETCH_URL: <url> or NONE. No other text."
+    system = "You output exactly one line: FETCH_URL: <url> or SEARCH_QUERY: <query> or NONE. No other text."
     reply, _ = generate_reply_routed(
-        prompt, system, max_tokens=80, source_context=source_context,
+        prompt, system, max_tokens=120, source_context=source_context,
         provider_mode="auto", timeout_s=30.0, retries=2, failover=True, no_llm=False,
     )
     if not reply:
@@ -132,19 +132,31 @@ def _propose_autonomy_fetch(
     line = (reply or "").strip().upper()
     if line == "NONE":
         return None
+    # FETCH_URL: <url>
     match = re.search(r"FETCH_URL:\s*(\S+)", reply, re.IGNORECASE)
-    if not match:
-        return None
-    url = (match.group(1) or "").strip().rstrip(".,;")
-    if not url.startswith(("http://", "https://")) or len(url) > 2048:
-        return None
-    return {
-        "source": "internal",
-        "action_type": "NET_FETCH",
-        "payload": {"url": url},
-        "expected_dt_impact": 0.6,
-        "risk": 0.25,
-    }
+    if match:
+        url = (match.group(1) or "").strip().rstrip(".,;")
+        if url.startswith(("http://", "https://")) and len(url) <= 2048:
+            return {
+                "source": "internal",
+                "action_type": "NET_FETCH",
+                "payload": {"url": url},
+                "expected_dt_impact": 0.6,
+                "risk": 0.25,
+            }
+    # SEARCH_QUERY: <query>
+    match = re.search(r"SEARCH_QUERY:\s*(.+)", reply, re.IGNORECASE | re.DOTALL)
+    if match:
+        query = (match.group(1) or "").strip().rstrip(".,;")[:500]
+        if query:
+            return {
+                "source": "internal",
+                "action_type": "WEB_SEARCH",
+                "payload": {"query": query},
+                "expected_dt_impact": 0.6,
+                "risk": 0.2,
+            }
+    return None
 
 
 def should_consider_post(
@@ -343,6 +355,15 @@ def run_autonomy_tick(
                                             if life_kernel:
                                                 life_kernel.set_last_action("NET_FETCH")
                                             return (last_post, last_intent)
+                                    if action_type == "WEB_SEARCH":
+                                        query = (payload.get("query") or "").strip()
+                                        if query:
+                                            executor_execute_fn(instance_id, [
+                                                {"action": "WEB_SEARCH", "args": {"query": query}},
+                                            ])
+                                            if life_kernel:
+                                                life_kernel.set_last_action("WEB_SEARCH")
+                                            return (last_post, last_intent)
                                     if action_type == "STATE_UPDATE":
                                         try:
                                             if state_update_fn:
@@ -431,6 +452,13 @@ def run_autonomy_tick(
                         executor_execute_fn(instance_id, [
                             {"action": "NET_FETCH", "args": {"url": url}},
                         ])
+                elif action_type == "WEB_SEARCH":
+                    payload = will_result.proposal.get("payload") or {}
+                    query = (payload.get("query") or "").strip()
+                    if query:
+                        executor_execute_fn(instance_id, [
+                            {"action": "WEB_SEARCH", "args": {"query": query}},
+                        ])
                     # commit_end in finally
                 # Intent-loop proposals: map to executable PUBLISH_POST or NET_FETCH
                 elif action_type in ("seek_energy", "rest"):
@@ -517,6 +545,23 @@ def run_autonomy_tick(
                             {"action": "NET_FETCH", "args": {"url": url}},
                         ])
                     last_intent_out = "explore"
+                elif action_type == "web_browse":
+                    # One-shot browse decision: fetch or search (no interval gate; will kernel already chose to browse)
+                    fetch_proposal = _propose_autonomy_fetch(life_state, delta_t, life_kernel, source_context=source_context)
+                    if fetch_proposal:
+                        bt = fetch_proposal.get("action_type", "")
+                        payload = fetch_proposal.get("payload") or {}
+                        if bt == "NET_FETCH":
+                            url = (payload.get("url") or "").strip()
+                            if url and url.startswith(("http://", "https://")):
+                                executor_execute_fn(instance_id, [{"action": "NET_FETCH", "args": {"url": url}}])
+                        elif bt == "WEB_SEARCH":
+                            query = (payload.get("query") or "").strip()
+                            if query:
+                                executor_execute_fn(instance_id, [{"action": "WEB_SEARCH", "args": {"query": query}}])
+                        if life_kernel:
+                            life_kernel.last_fetch_decision_tick = delta_t
+                    last_intent_out = "web_browse"
                 elif action_type == "maintain_legacy":
                     if runtime.can_speak() and runtime.spend_speech():
                         text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context)

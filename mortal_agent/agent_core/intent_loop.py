@@ -208,7 +208,7 @@ def generate_internal_proposals(
                 "risk": 0.20,
             })
 
-    # RELAXED + HEALTHY: Can explore
+    # RELAXED + HEALTHY: Can explore and browse (fetch/search chosen by will kernel or autonomy fetch prompt)
     if relaxed and not energy_low and not hazard_moderate:
         proposals.append({
             "source": "internal",
@@ -216,6 +216,13 @@ def generate_internal_proposals(
             "payload": {},
             "expected_dt_impact": 0.65,
             "risk": 0.25,
+        })
+        proposals.append({
+            "source": "internal",
+            "action_type": "web_browse",
+            "payload": {},
+            "expected_dt_impact": 0.60,
+            "risk": 0.20,
         })
         proposals.append({
             "source": "internal",

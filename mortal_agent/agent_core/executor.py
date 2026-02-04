@@ -1,10 +1,11 @@
-"""Action Executor: PUBLISH_POST + NET_FETCH. All outbound via canon; optional network pipeline."""
+"""Action Executor: PUBLISH_POST + NET_FETCH + WEB_SEARCH. All outbound via canon; optional network pipeline."""
 from typing import Dict, Any, List, Optional, Callable
 from .canon import CanonConfig, validate_post
 
 ACTION_PUBLISH_POST = "PUBLISH_POST"
 ACTION_NET_FETCH = "NET_FETCH"
-ALLOWED_ACTIONS = [ACTION_PUBLISH_POST, ACTION_NET_FETCH]
+ACTION_WEB_SEARCH = "WEB_SEARCH"
+ALLOWED_ACTIONS = [ACTION_PUBLISH_POST, ACTION_NET_FETCH, ACTION_WEB_SEARCH]
 
 def parse_actions(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -30,7 +31,7 @@ class Executor:
                 ok, err = self._execute_publish_post(instance_id, args, result)
                 if not ok and err:
                     result["errors"].append(err)
-            elif action == ACTION_NET_FETCH and self._run_network_pipeline:
+            elif action in (ACTION_NET_FETCH, ACTION_WEB_SEARCH) and self._run_network_pipeline:
                 r = self._run_network_pipeline(item, instance_id)
                 if not r.get("executed") and r.get("error"):
                     result["errors"].append(r.get("error", "network_failed"))
