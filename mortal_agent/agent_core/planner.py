@@ -17,6 +17,8 @@ PLAN_SCHEMA = {
 }
 
 CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_ACT_IMMEDIATE = 0.8   # act immediately without asking
+CONFIDENCE_QUICK_CHECK = 0.5     # quick check then act; below this ask guidance only if high-risk
 MAX_REASONS = 5
 
 
@@ -30,6 +32,18 @@ class PlanResult:
 
     def should_post(self, threshold: float = CONFIDENCE_THRESHOLD) -> bool:
         return self.valid and self.confidence >= threshold and (self.text or "").strip() != ""
+
+    def should_act_immediately(self) -> bool:
+        """Confidence > 0.8: act immediately."""
+        return self.valid and self.confidence >= CONFIDENCE_ACT_IMMEDIATE
+
+    def should_quick_check_then_act(self) -> bool:
+        """Confidence > 0.5: quick check then act."""
+        return self.valid and CONFIDENCE_QUICK_CHECK <= self.confidence < CONFIDENCE_ACT_IMMEDIATE
+
+    def should_ask_if_high_risk(self, is_high_risk: bool) -> bool:
+        """Below 0.5: ask guidance ONLY if action is high-risk. Low-risk never ask."""
+        return self.valid and self.confidence < CONFIDENCE_QUICK_CHECK and is_high_risk
 
 
 def parse_plan_response(raw: str) -> PlanResult:

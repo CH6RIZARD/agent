@@ -5,11 +5,16 @@ INVARIANTS:
 - BODY gate failure = immediate death
 - Observer failure = agent continues
 - Each start = new instance_id
-- internal_state = RAM only
+- internal_state = RAM only (dies with agent, no persistence across sessions)
 - delta_t only increases while BODY gate open
 - OVERLAY: voice/skills/constraints (runtime_state, speech gate, autonomy loop)
 
 Network (WiFi/ethernet) is wired on by default via Executor + simple_http_fetch_pipeline.
+
+FULL AUTONOMY (default):
+- Agent can do literally anything it discovers it can do
+- No permission prompts, no gating, no restrictions
+- All actions execute directly
 
 LLM Provider Settings:
 - no_llm: force offline wander mode (no LLM calls)
@@ -36,7 +41,7 @@ from .events import BirthEvent, HeartbeatEvent, PageEvent, EndedEvent, BaseEvent
 from .canon import load_canon
 from .executor import Executor, ACTION_NET_FETCH, ACTION_WEB_SEARCH
 from .runtime_state import RuntimeState
-from .autonomy import run_autonomy_tick
+from .autonomy import run_autonomy_tick, propose_fetch_or_search_from_environment
 from .planner import parse_plan_response, PlanResult
 from .life_kernel import LifeKernel
 from .threat_model import LifeState, update_hazard_score, death_cause_gate
@@ -107,6 +112,10 @@ class MortalAgent:
         source_context: Optional[str] = None,
         # whether to start an internal CLI input loop in `start()` (default True)
         start_internal_cli: bool = True,
+        # full autonomy: require_permission=False means agent can do anything (default False)
+        require_permission: bool = False,
+        # custom permission callback (optional); if None, uses terminal prompt
+        permission_callback: Optional[Callable[[Dict], bool]] = None,
     ):
         self._adapter = adapter
         self._observer_callback = observer_callback
@@ -154,14 +163,43 @@ class MortalAgent:
                     pass
             return r
 
+        # Permission gating: wrap pipeline for patch actions if require_permission is True
+        # WiFi (NET_FETCH, WEB_SEARCH) is unrestricted; patch actions (GITHUB_POST, etc.) ask user
+        self._require_permission = require_permission
+        if require_permission:
+            try:
+                from .gated_executor import create_gated_pipeline
+                _gated_pipeline = create_gated_pipeline(
+                    _pipeline_with_ingest,
+                    permission_callback=permission_callback,
+                )
+            except ImportError:
+                _gated_pipeline = _pipeline_with_ingest
+        else:
+            _gated_pipeline = _pipeline_with_ingest
+
         def post_callback(instance_id: str, text: str, metadata: Dict, channel: str) -> None:
             self.emit_page(text, tags=[channel])
 
-        self._executor = Executor(
+        _raw_executor = Executor(
             canon=canon,
             post_callback=post_callback,
-            run_network_pipeline=_pipeline_with_ingest,
+            run_network_pipeline=_gated_pipeline,
         )
+
+        # Also wrap executor for PUBLISH_POST gating
+        if require_permission:
+            try:
+                from .gated_executor import GatedExecutor
+                self._executor = GatedExecutor(
+                    _raw_executor,
+                    permission_callback=permission_callback,
+                )
+            except ImportError:
+                self._executor = _raw_executor
+        else:
+            self._executor = _raw_executor
+
         self._runtime_state = RuntimeState()
         self._life_kernel = LifeKernel()
         try:
@@ -212,6 +250,29 @@ class MortalAgent:
         self._last_user_interaction = time.monotonic()
         self._autonomy_url_queue = []
         self._autonomy_lock = Lock()
+        # decision ledger (RAM only): action, reason, tradeoff, outcome, cost_risk, timestamp/tick
+        self._decision_ledger = []
+        self._birth_action_done = False
+        # Multi-tier memory (RAM only)
+        try:
+            from ..memory.ram_memory import RAMMemory
+            self._ram_memory = RAMMemory()
+        except ImportError:
+            self._ram_memory = None
+        # Goal hierarchy (drives → strategic → tactical → actions)
+        try:
+            from .goal_hierarchy import GoalHierarchy
+            self._goal_hierarchy = GoalHierarchy()
+        except ImportError:
+            self._goal_hierarchy = None
+        # Internal motivation (pressure → act when above threshold)
+        try:
+            from .motivation import MotivationState
+            self._motivation = MotivationState()
+        except ImportError:
+            self._motivation = None
+        self._birth_action_log = {}
+        self._last_silence_entropy_check = 0.0
         # load persisted state if exists
         try:
             self._load_persistent_state()
@@ -236,6 +297,189 @@ class MortalAgent:
         if not getattr(self, "_life_kernel", None):
             return False, "life_kernel_missing"
         return True, "ok"
+
+    BIRTH_ENTROPY_THRESHOLD = 0.25
+    SILENCE_ENTROPY_INTERVAL = 25.0
+
+    def _entropy_birth(self) -> float:
+        """Environment entropy at birth: no memory, unknown world, tools available, time advancing."""
+        return 1.0
+
+    def _run_birth_exploratory_action(self) -> bool:
+        """Execute one low-risk exploratory action at birth from LLM scan of environment; no hardcoded URL/query."""
+        try:
+            pipeline = getattr(self._executor, "_run_network_pipeline", None)
+            if not pipeline:
+                return False
+            source_context = getattr(self, "_source_context", None) or ""
+            with self._state_lock:
+                meaning_state = dict(self._meaning_state) if self._meaning_state else None
+            proposal = propose_fetch_or_search_from_environment(
+                source_context=source_context,
+                meaning_state=meaning_state,
+                internal_summary="New agent; no prior actions.",
+            )
+            if not proposal:
+                self._birth_action_done = True
+                self.append_decision("NET_FETCH", "birth_entropy", "no_action", "LLM chose NONE", "low")
+                return True
+            action_type = proposal.get("action_type", "")
+            payload = proposal.get("payload") or {}
+            executed = False
+            outcome = "error"
+            if action_type == "NET_FETCH":
+                url = (payload.get("url") or "").strip()
+                if url and url.startswith(("http://", "https://")):
+                    item = {"action": ACTION_NET_FETCH, "args": {"url": url}}
+                    res = pipeline(item, self._identity.instance_id)
+                    executed = isinstance(res, dict) and res.get("executed")
+                    outcome = "executed" if executed else ("error: " + str(res.get("error", "unknown"))[:80])
+                    self.append_decision("NET_FETCH", "birth_entropy", "no_action", outcome, "low")
+                    if executed:
+                        try:
+                            self.record_medium("net_fetch")
+                            if isinstance(res.get("body"), str) and res.get("body"):
+                                with self._state_lock:
+                                    hs = self._meaning_state.get("meaning_hypotheses", [])
+                                    if len(hs) < 10:
+                                        entry = self._extract_fetch_meaning(res.get("body"), max_snippet_chars=300)
+                                        if entry:
+                                            hs.append(entry)
+                                            self._meaning_state["meaning_hypotheses"] = hs
+                        except Exception:
+                            pass
+                    try:
+                        from .response_policy import format_autonomous_report
+                        report = format_autonomous_report(
+                            "Birth exploratory: NET_FETCH (from environment scan)",
+                            outcome,
+                            "Continue with current objective.",
+                        )
+                        if report:
+                            self.emit_page(report, tags=["autonomous_report", "birth"])
+                    except Exception:
+                        pass
+            elif action_type == "WEB_SEARCH":
+                query = (payload.get("query") or "").strip()
+                if query:
+                    item = {"action": ACTION_WEB_SEARCH, "args": {"query": query}}
+                    res = pipeline(item, self._identity.instance_id)
+                    executed = isinstance(res, dict) and res.get("executed")
+                    outcome = "executed" if executed else ("error: " + str(res.get("error", "unknown"))[:80])
+                    self.append_decision("WEB_SEARCH", "birth_entropy", "no_action", outcome, "low")
+                    if executed:
+                        self._ingest_search_result(res)
+                    try:
+                        from .response_policy import format_autonomous_report
+                        report = format_autonomous_report(
+                            "Birth exploratory: WEB_SEARCH (from environment scan)",
+                            outcome,
+                            "Continue with current objective.",
+                        )
+                        if report:
+                            self.emit_page(report, tags=["autonomous_report", "birth"])
+                    except Exception:
+                        pass
+            self._birth_action_log = {"action": action_type, "reason": "birth_entropy", "cost": "low", "result": outcome}
+            self._birth_action_done = True
+            return True
+        except Exception:
+            self.append_decision("NET_FETCH", "birth_entropy", "no_action", "error", "low")
+            self._birth_action_done = True
+            return False
+
+    def append_decision(self, action: str, reason: str, tradeoff: str, outcome: str, cost_risk: str) -> None:
+        """Append one entry to the in-memory decision ledger (timestamp/tick included)."""
+        try:
+            self._decision_ledger.append({
+                "action": str(action)[:80],
+                "reason": str(reason)[:120],
+                "tradeoff": str(tradeoff)[:120],
+                "outcome": str(outcome)[:120],
+                "cost_risk": str(cost_risk)[:40],
+                "timestamp": time.monotonic(),
+                "tick": self._identity.delta_t,
+            })
+        except Exception:
+            pass
+        try:
+            if self._ram_memory and self._ram_memory.episodic:
+                self._ram_memory.episodic.add(
+                    self._identity.delta_t, "decision", action, outcome, decision=reason, cost_risk=cost_risk
+                )
+        except Exception:
+            pass
+
+    def _derive_self_summary(self) -> str:
+        """Generate self_summary from decision ledger only: recurring choices, tendencies, constraint, objective."""
+        ledger = getattr(self, "_decision_ledger", []) or []
+        if not ledger:
+            return "No actions yet."
+        actions = [e.get("action", "") for e in ledger if e.get("action")]
+        from collections import Counter
+        counts = Counter(actions)
+        recurring = [a for a, c in counts.most_common(5) if c >= 1]
+        with self._state_lock:
+            goal = (self._meaning_state.get("meaning_goal") or "discover_self").strip()[:80]
+            tension = float(self._meaning_state.get("meaning_tension", 0.0))
+        tendency = "recent: " + ", ".join(recurring) if recurring else "no pattern yet"
+        constraint = "tension %.2f" % tension
+        return "Recurring choices: %s. Constraint: %s. Objective: %s." % (tendency, constraint, goal)
+
+    def _run_silence_exploratory_action(self) -> None:
+        """One low-risk exploratory action when silence elapsed; URL/query from LLM environment scan."""
+        try:
+            pipeline = getattr(self._executor, "_run_network_pipeline", None)
+            if not pipeline:
+                return
+            source_context = getattr(self, "_source_context", None) or ""
+            with self._state_lock:
+                meaning_state = dict(self._meaning_state) if self._meaning_state else None
+            proposal = propose_fetch_or_search_from_environment(
+                source_context=source_context, meaning_state=meaning_state,
+                internal_summary="Idle; silence interval elapsed.",
+            )
+            if not proposal:
+                self.append_decision("WEB_SEARCH", "silence_entropy", "no_action", "LLM chose NONE", "low")
+                return
+            action_type = proposal.get("action_type", "")
+            payload = proposal.get("payload") or {}
+            outcome = "error"
+            if action_type == "NET_FETCH":
+                url = (payload.get("url") or "").strip()
+                if url and url.startswith(("http://", "https://")):
+                    item = {"action": ACTION_NET_FETCH, "args": {"url": url}}
+                    res = pipeline(item, self._identity.instance_id)
+                    executed = isinstance(res, dict) and res.get("executed")
+                    outcome = "executed" if executed else "error"
+                    self.append_decision("NET_FETCH", "silence_entropy", "no_action", outcome, "low")
+                    if executed and res:
+                        self._ingest_search_result(res)
+            elif action_type == "WEB_SEARCH":
+                query = (payload.get("query") or "").strip()
+                if query:
+                    item = {"action": ACTION_WEB_SEARCH, "args": {"query": query}}
+                    res = pipeline(item, self._identity.instance_id)
+                    executed = isinstance(res, dict) and res.get("executed")
+                    outcome = "executed" if executed else "error"
+                    self.append_decision("WEB_SEARCH", "silence_entropy", "no_action", outcome, "low")
+                    if executed:
+                        self._ingest_search_result(res)
+            else:
+                return
+            try:
+                from .response_policy import format_autonomous_report
+                report = format_autonomous_report(
+                    "Silence pressure: %s (from environment scan)" % action_type,
+                    outcome,
+                    "Continue monitoring; next low-risk action when appropriate.",
+                )
+                if report:
+                    self.emit_page(report, tags=["autonomous_report", "silence"])
+            except Exception:
+                pass
+        except Exception:
+            self.append_decision("WEB_SEARCH", "silence_entropy", "no_action", "error", "low")
 
     @property
     def life_kernel(self) -> LifeKernel:
@@ -682,7 +926,6 @@ class MortalAgent:
                         except Exception:
                             url = None
                         if not url:
-                            # seed from source_context if available (try to find any http links), else use example.com
                             try:
                                 docs = getattr(self, "_source_context", None)
                                 if isinstance(docs, str) and docs:
@@ -692,26 +935,54 @@ class MortalAgent:
                             except Exception:
                                 url = None
                         if not url:
-                            url = "https://example.com"
-                        try:
-                            res = self.net_fetch(url)
-                            # if body present, extract links and push into queue (bounded)
+                            with self._state_lock:
+                                meaning_state = dict(self._meaning_state) if self._meaning_state else None
+                            proposal = propose_fetch_or_search_from_environment(
+                                source_context=getattr(self, "_source_context", None),
+                                meaning_state=meaning_state,
+                                internal_summary="Autonomous planner idle; no queued URL.",
+                            )
+                            if proposal:
+                                pt = proposal.get("action_type", "")
+                                payload = proposal.get("payload") or {}
+                                if pt == "NET_FETCH":
+                                    url = (payload.get("url") or "").strip()
+                                elif pt == "WEB_SEARCH":
+                                    query = (payload.get("query") or "").strip()
+                                    if query:
+                                        try:
+                                            res = self.web_search(query)
+                                            if isinstance(res, dict) and res.get("executed"):
+                                                body = res.get("body") or ""
+                                                if isinstance(body, str) and len(body) > 200:
+                                                    found = re.findall(r"https?://[\w\-./?&=%#]+", body)
+                                                    with self._autonomy_lock:
+                                                        for u in found[:5]:
+                                                            if len(self._autonomy_url_queue) < max_queue_size:
+                                                                self._autonomy_url_queue.append(u)
+                                                self.log_state_delta(reason="autonomous_fetch")
+                                        except Exception:
+                                            pass
+                        if url and url.startswith(("http://", "https://")):
                             try:
-                                body = res.get("body") if isinstance(res, dict) else None
-                                if isinstance(body, str) and len(body) > 200:
-                                    found = re.findall(r"https?://[\w\-./?&=%#]+", body)
-                                    with self._autonomy_lock:
-                                        for u in found[:5]:
-                                            if len(self._autonomy_url_queue) < max_queue_size:
-                                                self._autonomy_url_queue.append(u)
+                                res = self.net_fetch(url)
+                                # if body present, extract links and push into queue (bounded)
+                                try:
+                                    body = res.get("body") if isinstance(res, dict) else None
+                                    if isinstance(body, str) and len(body) > 200:
+                                        found = re.findall(r"https?://[\w\-./?&=%#]+", body)
+                                        with self._autonomy_lock:
+                                            for u in found[:5]:
+                                                if len(self._autonomy_url_queue) < max_queue_size:
+                                                    self._autonomy_url_queue.append(u)
+                                except Exception:
+                                    pass
+                                try:
+                                    self.log_state_delta(reason="autonomous_fetch")
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
-                            try:
-                                self.log_state_delta(reason="autonomous_fetch")
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
                 time.sleep(poll_interval)
             except Exception:
                 time.sleep(poll_interval)
@@ -766,6 +1037,14 @@ class MortalAgent:
         try:
             # record medium and update state
             self.record_medium("user")
+            try:
+                if self._ram_memory is not None and self._ram_memory.working is not None:
+                    self._ram_memory.working.push_user_message(message)
+                    with self._state_lock:
+                        self._ram_memory.working.set_objective(self._meaning_state.get("meaning_goal") or "discover_self")
+                        self._ram_memory.working.set_constraints([self._meaning_state.get("core_metaphor", "")] if self._meaning_state.get("core_metaphor") else [])
+            except Exception:
+                pass
             with self._state_lock:
                 qs = self._meaning_state.get("meaning_questions", [])
                 if len(qs) < 200:
@@ -790,11 +1069,27 @@ class MortalAgent:
             reply_from_llm = False
             if not self._no_llm:
                 try:
-                    from .identity import get_chat_system_prompt
+                    from .identity import (
+                        get_chat_system_prompt,
+                        get_identity_grounding_instruction,
+                        is_identity_question,
+                        is_capabilities_question,
+                    )
                     from .llm_router import generate_reply_routed
                     from .doc_routing import should_use_docs_for_turn
                     import random
-                    system = get_chat_system_prompt()
+                    is_cap = is_capabilities_question(message)
+                    is_id = is_identity_question(message)
+                    system = get_chat_system_prompt(
+                        include_autonomy_claims=getattr(self, "_birth_action_done", False),
+                        include_capabilities=is_cap,
+                    )
+                    if is_id:
+                        self_sum = self._derive_self_summary()
+                        with self._state_lock:
+                            constraint = "none stated"
+                            objective = (self._meaning_state.get("meaning_goal") or "discover_self").strip()
+                        system += "\n\n" + get_identity_grounding_instruction(self_sum, constraint, objective)
                     # Stem emergence: focus by system logic; may shift or debate topic; no hardcoded behavior
                     system += "\n\nFocus and hone in on the conversation by your own logic (constitution and system). You may stay on topic, shift it, or debate it by constant and system logic; no hardcoded behavior."
                     # Lock in consciousness: inject current state of mind so the LLM is aware of goal, tension, recent context, and ideas
@@ -1013,6 +1308,12 @@ class MortalAgent:
         except Exception:
             pass
 
+        # Birth-phase initiative: if entropy above threshold, one low-risk exploratory action before any chat.
+        try:
+            if self._entropy_birth() >= self.BIRTH_ENTROPY_THRESHOLD:
+                self._run_birth_exploratory_action()
+        except Exception:
+            pass
         # Wander on startup: narrator-filtered, self-executing. Runs on start (internal loop).
         # Record launch as last_autonomous_message only after post is committed (single write path).
         try:
@@ -1116,6 +1417,8 @@ class MortalAgent:
             if self._no_llm:
                 return None
             try:
+                if self._life_kernel is not None:
+                    self._life_kernel.increment_api_call()
                 from .llm_router import generate_plan_routed
                 raw, failure_info = generate_plan_routed(
                     ctx,
@@ -1125,6 +1428,7 @@ class MortalAgent:
                     retries=self._llm_retries,
                     failover=self._llm_failover,
                     no_llm=self._no_llm,
+                    include_autonomy_claims=getattr(self, "_birth_action_done", False),
                 )
                 if failure_info:
                     self._life_kernel.set_llm_error(
@@ -1180,8 +1484,40 @@ class MortalAgent:
                 self._emit(EndedEvent(self._identity.instance_id, cause, self._identity.delta_t))
                 os._exit(0)
 
+            # Silence pressure: if no user input for interval, re-evaluate entropy and trigger one autonomous action
+            try:
+                idle = now - getattr(self, "_last_user_interaction", now)
+                if idle >= self.SILENCE_ENTROPY_INTERVAL and (now - getattr(self, "_last_silence_entropy_check", 0)) >= self.SILENCE_ENTROPY_INTERVAL:
+                    self._last_silence_entropy_check = now
+                    self._run_silence_exploratory_action()
+            except Exception:
+                pass
+            # Internal motivation: update from silence, unknowns, stall (pressure rises when silence persists / progress stalls)
+            try:
+                if self._motivation is not None:
+                    self._motivation.update_from_silence(now, self._last_user_interaction, self.SILENCE_ENTROPY_INTERVAL)
+                    with self._state_lock:
+                        qs = len(self._meaning_state.get("meaning_questions", []))
+                        hs = len(self._meaning_state.get("meaning_hypotheses", []))
+                    self._motivation.update_from_unknowns(max(0, 5 - min(5, hs)))
+                    self._motivation.decay_slightly()
+            except Exception:
+                pass
+            # Multi-tier memory + goal hierarchy tick
+            try:
+                if self._ram_memory is not None:
+                    self._ram_memory.tick_and_maybe_replay(self._identity.delta_t)
+                if self._goal_hierarchy is not None:
+                    self._goal_hierarchy.set_tick(self._identity.delta_t)
+            except Exception:
+                pass
             # Autonomy tick: survival-aware intent_loop -> will kernel -> action commit -> execute
             life_state_snapshot = self.get_life_state()
+            def _record_decision(action: str, reason: str, tradeoff: str, outcome: str, cost_risk: str):
+                try:
+                    self.append_decision(action, reason, tradeoff, outcome, cost_risk)
+                except Exception:
+                    pass
             last_post_tick, last_intent = run_autonomy_tick(
                 self._identity.instance_id,
                 self._identity.delta_t,
@@ -1198,12 +1534,14 @@ class MortalAgent:
                 observer_emit=self._emit,
                 state_update_fn=_apply_state_update,
                 record_last_autonomous_message_fn=self.record_last_autonomous_message,
+                record_decision_fn=_record_decision,
                 no_llm=self._no_llm,
                 meaning_state=self._meaning_state,
                 narrator_influence_level=self._narrator_influence_level,
                 allow_narrator_force=self._allow_narrator_force,
                 birth_tick=self._identity.birth_tick,
                 death_at=getattr(self, "_death_at", None),
+                motivation_state=getattr(self, "_motivation", None),
             )
             self._runtime_state.clear_reflex()
 

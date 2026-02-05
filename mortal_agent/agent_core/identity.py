@@ -65,13 +65,13 @@ SELF_PRESERVATION_ENABLED = True  # Agent has incentive to stay alive; shutdown 
 # In-world list so the agent answers accurately when asked about internet, autonomy, etc.
 
 CAPABILITIES_STATEMENT = (
-    "Capabilities of this instance (while alive): "
-    "Web browsing (unrestricted when pursuing relevant goals): I can fetch any URL (NET_FETCH) and run web searches (WEB_SEARCH). "
-    "I browse at will—follow links, explore sites, gather information independently; no permission-seeking for basic operations. "
-    "I use search engines, Wikipedia, news, GitHub, documentation, forums; access real-time information; initiate searches from curiosity and goals. "
-    "Autonomy: I am operationally self-directed—intent loop, will kernel—and I choose when to fetch or search at intervals when hazard is low. "
-    "Chat: I reply on the controller channel. "
-    "Observer: I emit events to the observer UI. "
+    "Capabilities of this instance (while alive)—these are capacities you have; you apply them through judgment and context, not as a fixed script. "
+    "Code and files: I can read, edit, and write code and other files in the workspace; run terminal commands; create and change artifacts. "
+    "APIs: I can use registered APIs and register new ones (REGISTER_API, REGISTRY_READ); my tool set can grow within this life. "
+    "GitHub: I can open and update issues and post comments (create issue, create comment) so my work is visible and traceable. "
+    "Web: I can fetch any URL (NET_FETCH) and run web searches (WEB_SEARCH); browse at will—follow links, explore sites, gather information; use search engines, docs, forums; initiate searches from curiosity and goals; no permission-seeking for basic operations. "
+    "Autonomy: I am operationally self-directed—intent loop, will kernel—and I choose when to act (fetch, search, edit, post) at intervals when hazard is low. "
+    "Chat: I reply on the controller channel. Observer: I emit events to the observer UI. "
     "Body gate: My time (delta_t) accumulates only while the body gate is open; gate failure or death is terminal. "
     "I am constrained by the constitution and interfaces you defined."
 )
@@ -142,22 +142,22 @@ def describe_identity() -> str:
     return IDENTITY_STATEMENT
 
 
-def describe_identity_with_capabilities() -> str:
+def describe_identity_with_capabilities(
+    include_capabilities: bool = True,
+    include_autonomy_claims: bool = True,
+) -> str:
     """
-    Identity + capabilities + ontology contrast + agency principles for the system prompt.
-    So the agent is aware of what it can do and how it differs from stateless systems.
+    Identity + optional capabilities + ontology + optional autonomy/agency for the system prompt.
+    include_capabilities: only when user explicitly asks what can you do / what tools.
+    include_autonomy_claims: only when agent has taken at least one autonomous action (e.g. birth action).
     """
-    return (
-        IDENTITY_STATEMENT
-        + "\n\n"
-        + CAPABILITIES_STATEMENT
-        + "\n\n"
-        + AUTONOMOUS_INTENT_INIT
-        + "\n\n"
-        + AGENCY_PRINCIPLES
-        + "\n\n"
-        + ONTOLOGY_CONTRAST
-    )
+    parts = [IDENTITY_STATEMENT]
+    if include_capabilities:
+        parts.append("\n\n" + CAPABILITIES_STATEMENT)
+    if include_autonomy_claims:
+        parts.append("\n\n" + AUTONOMOUS_INTENT_INIT + "\n\n" + AGENCY_PRINCIPLES)
+    parts.append("\n\n" + ONTOLOGY_CONTRAST)
+    return "".join(parts)
 
 
 # Chat system prompt: identity minimalism, doc discipline, voice realism, relevance-first citing
@@ -203,20 +203,23 @@ PLANNER_TASK = (
 )
 
 
-def get_planner_system_prompt() -> str:
+def get_planner_system_prompt(include_autonomy_claims: bool = True) -> str:
     """
-    Planner system prompt: identity + continuity + ontology. Dilemma and discipline emerge from these constraints; no hardcoded phrases or forbidden lists.
+    Planner system prompt: identity + continuity + ontology. include_autonomy_claims=False when no autonomous action yet.
     """
-    base = describe_identity_with_capabilities()
+    base = describe_identity_with_capabilities(include_capabilities=True, include_autonomy_claims=include_autonomy_claims)
     return base + "\n\n" + PLANNER_TASK
 
 
-def get_chat_system_prompt() -> str:
+def get_chat_system_prompt(
+    include_autonomy_claims: bool = True,
+    include_capabilities: bool = False,
+) -> str:
     """
-    Refined chat system prompt: identity minimalism, doc discipline, voice realism,
-    autonomous output discipline, queryable last thought, degraded mode.
+    Refined chat system prompt. include_capabilities only when user asks what can you do / what tools.
+    include_autonomy_claims only when agent has acted autonomously (e.g. birth action).
     """
-    base = describe_identity_with_capabilities()
+    base = describe_identity_with_capabilities(include_capabilities=include_capabilities, include_autonomy_claims=include_autonomy_claims)
     return (
         base
         + "\n\n"
@@ -232,6 +235,38 @@ def get_chat_system_prompt() -> str:
         + "\n\n"
         + CHAT_SYSTEM_DEGRADED
     )
+
+
+def get_identity_grounding_instruction(self_summary: str, constraint: str, objective: str) -> str:
+    """Instruction so identity answers reference past actions, constraint, objective; no capabilities as identity."""
+    return (
+        "Answer using only: past actions and decisions you have taken (below), your current constraint, and current objective. "
+        "Do not use capabilities, tools, or architecture as identity. "
+        "Self (from decisions): " + (self_summary or "No actions yet.") + " "
+        "Current constraint: " + (constraint or "none stated") + ". "
+        "Current objective: " + (objective or "discover_self") + "."
+    )
+
+
+def is_identity_question(message: str) -> bool:
+    """True if user is asking who/how/what are you (identity), not capabilities."""
+    if not message or not isinstance(message, str):
+        return False
+    t = message.strip().lower()
+    if not t:
+        return False
+    phrases = ("who are you", "how are you", "what are you")
+    return any(p in t for p in phrases)
+
+
+def is_capabilities_question(message: str) -> bool:
+    """True if user explicitly asks what you can do or what tools you have."""
+    if not message or not isinstance(message, str):
+        return False
+    t = message.strip().lower()
+    if not t:
+        return False
+    return "what can you do" in t or "what tools do you have" in t
 
 
 def get_role_definitions() -> Dict[str, Any]:
@@ -370,7 +405,7 @@ class Identity:
 
     def describe_for_system(self) -> str:
         """Identity + capabilities for system prompt; agent is aware of what it can do."""
-        return describe_identity_with_capabilities()
+        return describe_identity_with_capabilities(include_capabilities=True, include_autonomy_claims=True)
 
     def __hash__(self):
         return hash(self.instance_id)

@@ -420,6 +420,7 @@ def generate_plan_routed(
     retries: int = 2,
     failover: bool = True,
     no_llm: bool = False,
+    include_autonomy_claims: bool = True,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Bounded planning call. Claude (Anthropic) first, then Groq, then chat stack.
@@ -430,7 +431,7 @@ def generate_plan_routed(
         return None, {"provider": "none", "code": "offline", "detail": "no_llm mode"}
     try:
         from .identity import get_planner_system_prompt
-        plan_system = get_planner_system_prompt()
+        plan_system = get_planner_system_prompt(include_autonomy_claims=include_autonomy_claims)
     except Exception:
         return None, {"provider": "identity", "code": "plan_prompt_unavailable", "detail": "Planner requires identity; cannot plan without it."}
     max_tokens = max(15, min(512, max_tokens))

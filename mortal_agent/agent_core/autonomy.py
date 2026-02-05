@@ -18,9 +18,22 @@ import time
 from pathlib import Path
 from typing import Optional, Callable, Any, Dict
 from .runtime_state import RuntimeState
-from .planner import PlanResult, parse_plan_response, default_action, CONFIDENCE_THRESHOLD
+from .planner import (
+    PlanResult,
+    parse_plan_response,
+    default_action,
+    CONFIDENCE_THRESHOLD,
+    CONFIDENCE_ACT_IMMEDIATE,
+    CONFIDENCE_QUICK_CHECK,
+)
 from .narrator import narrate, generate_narrator_bias, generate_narrator_proposal
 import json
+
+try:
+    from .capabilities import is_low_risk_action
+except ImportError:
+    def is_low_risk_action(action: str) -> bool:
+        return (action or "").lower() in ("web_search", "net_fetch", "publish_post", "web_fetch", "view_file", "wikipedia_lookup", "send_email", "post_social_media")
 
 def _autonomy_fallback_text() -> str:
     """LLM-only: single fallback when no LLM text for autonomous post."""
@@ -83,10 +96,19 @@ except ImportError:
     textforge = None
 
 AUTONOMY_TICK_INTERVAL = 2.0
-POST_COOLDOWN_SECONDS = 30.0
-INITIATIVE_MIN_INTERVAL = 60.0
-FETCH_DECISION_INTERVAL = 35.0  # seconds between autonomy browse decisions (fetch or search)
-WANDER_INTERVAL = 45.0  # seconds between offline wander posts
+POST_COOLDOWN_SECONDS = 15.0
+INITIATIVE_MIN_INTERVAL = 25.0
+FETCH_DECISION_INTERVAL = 12.0  # seconds between autonomy browse decisions (fetch or search)
+WANDER_INTERVAL = 25.0  # seconds between offline wander posts
+
+# All patch/capability actions autonomy can execute via executor (GITHUB_POST, TRACE_SAVE, etc.)
+try:
+    from ..patches import PATCH_ACTIONS as _AUTONOMY_PASSTHROUGH_ACTIONS
+except Exception:
+    _AUTONOMY_PASSTHROUGH_ACTIONS = frozenset({
+        "GITHUB_POST", "TRACE_SAVE", "TRACE_READ", "FILE_HOST", "FORM_SUBMIT",
+        "CLOUD_SPINUP", "CODE_REPO", "PAYMENT", "REGISTER_API", "REGISTRY_READ",
+    })
 
 _AUTONOMY_FETCH_PROMPT_PATH = Path(__file__).resolve().parent.parent / "templates" / "autonomy_fetch.md"
 
@@ -96,6 +118,83 @@ def _load_autonomy_fetch_prompt() -> str:
     if _AUTONOMY_FETCH_PROMPT_PATH.exists():
         return _AUTONOMY_FETCH_PROMPT_PATH.read_text(encoding="utf-8", errors="replace").strip()
     return ""
+
+
+def propose_fetch_or_search_from_environment(
+    source_context: Optional[str] = None,
+    meaning_state: Optional[Dict[str, Any]] = None,
+    internal_summary: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    LLM scan of internal and external environment → one FETCH_URL, SEARCH_QUERY, or NONE.
+    No hardcoded URLs or queries. Used for birth, silence, explore fallback, and planner seed.
+    Returns same shape as _propose_autonomy_fetch: {"action_type": "NET_FETCH"|"WEB_SEARCH", "payload": {...}} or None.
+    """
+    try:
+        from .llm_router import generate_reply_routed
+    except ImportError:
+        return None
+    raw = _load_autonomy_fetch_prompt()
+    if not raw:
+        return None
+    # Minimal state placeholders for template
+    prompt = raw.replace("{{energy_normalized}}", "0.5")
+    prompt = prompt.replace("{{hazard_score}}", "0.0")
+    prompt = prompt.replace("{{delta_t_seconds}}", "0")
+    # Build meaning_context from internal + external scan (no example domains)
+    internal = (internal_summary or "").strip()
+    if not internal and meaning_state and isinstance(meaning_state, dict):
+        goal = (meaning_state.get("meaning_goal") or "").strip()[:120]
+        tension = float(meaning_state.get("meaning_tension", 0.0))
+        hs = list(meaning_state.get("meaning_hypotheses", []))[-3:]
+        parts = [f"Goal: {goal or 'discover_self'}", f"Tension: {tension:.2f}"]
+        if hs:
+            parts.append("Recent: " + "; ".join((str(h)[:60] for h in hs)))
+        internal = "\n- ".join(parts)
+    if not internal:
+        internal = "New or idle; no prior actions."
+    external = (source_context or "").strip()[:2400]
+    if not external:
+        external = "No external docs provided."
+    meaning_context = (
+        "**Environment scan (choose URL or search from this; no placeholder domains):**\n"
+        "- Internal: " + internal + "\n"
+        "- External (excerpt): " + external[:800] + "\n\n"
+    )
+    prompt = prompt.replace("{{meaning_context}}", meaning_context)
+    system = "You output exactly one line: FETCH_URL: <url> or SEARCH_QUERY: <query> or NONE. No other text. No example.com or example domains."
+    reply, _ = generate_reply_routed(
+        prompt, system, max_tokens=120, source_context=source_context,
+        provider_mode="auto", timeout_s=30.0, retries=2, failover=True, no_llm=False,
+    )
+    if not reply:
+        return None
+    line = (reply or "").strip().upper()
+    if line == "NONE":
+        return None
+    match = re.search(r"FETCH_URL:\s*(\S+)", reply, re.IGNORECASE)
+    if match:
+        url = (match.group(1) or "").strip().rstrip(".,;")
+        if url.startswith(("http://", "https://")) and len(url) <= 2048 and "example.com" not in url.lower():
+            return {
+                "source": "environment_scan",
+                "action_type": "NET_FETCH",
+                "payload": {"url": url},
+                "expected_dt_impact": 0.6,
+                "risk": 0.25,
+            }
+    match = re.search(r"SEARCH_QUERY:\s*(.+)", reply, re.IGNORECASE | re.DOTALL)
+    if match:
+        query = (match.group(1) or "").strip().rstrip(".,;")[:500]
+        if query and query.lower() != "example":
+            return {
+                "source": "environment_scan",
+                "action_type": "WEB_SEARCH",
+                "payload": {"query": query},
+                "expected_dt_impact": 0.6,
+                "risk": 0.2,
+            }
+    return None
 
 
 def _propose_autonomy_fetch(
@@ -261,6 +360,7 @@ def run_autonomy_tick(
     observer_emit: Optional[Callable[[Any], None]] = None,
     state_update_fn: Optional[Callable[[dict], None]] = None,
     record_last_autonomous_message_fn: Optional[Callable[[str], None]] = None,
+    record_decision_fn: Optional[Callable[[str, str, str, str, str], None]] = None,
     debug_mode: bool = False,
     no_llm: bool = False,
     meaning_state: Optional[Dict[str, Any]] = None,
@@ -273,6 +373,8 @@ def run_autonomy_tick(
     # survival-aware parameters (new)
     birth_tick: float = 0.0,
     death_at: Optional[float] = None,
+    # internal motivation (pressure → act when above threshold)
+    motivation_state: Optional[Any] = None,
 ) -> tuple:
     """
     One autonomy tick. Internal proposals -> will kernel -> action commit -> execute.
@@ -284,9 +386,15 @@ def run_autonomy_tick(
     - Emits PageEvent with natural wander text
     """
     now = time.monotonic()
-    # Do not tick runtime here; main loop already ticks it (avoids double drain)
     last_post = last_post_tick
     last_intent_out = last_intent
+
+    def _ledger(action: str, reason: str, tradeoff: str, outcome: str, cost_risk: str):
+        if record_decision_fn:
+            try:
+                record_decision_fn(action, reason, tradeoff, outcome, cost_risk)
+            except Exception:
+                pass
 
     if runtime.depleted():
         return (last_post, last_intent_out)
@@ -311,6 +419,7 @@ def run_autonomy_tick(
                                 if life_kernel:
                                     life_kernel.last_wander_tick = delta_t
                                     life_kernel.set_last_action("wander")
+                                _ledger("PUBLISH_POST", "wander", "no_post", "executed", "low")
                                 if record_last_autonomous_message_fn and wander_text:
                                     try:
                                         record_last_autonomous_message_fn((wander_text or "").strip()[:200])
@@ -464,17 +573,18 @@ def run_autonomy_tick(
                     payload = will_result.proposal.get("payload") or {}
                     url = (payload.get("url") or "").strip()
                     if url and url.startswith(("http://", "https://")):
-                        executor_execute_fn(instance_id, [
+                        res = executor_execute_fn(instance_id, [
                             {"action": "NET_FETCH", "args": {"url": url}},
                         ])
+                        _ledger("NET_FETCH", "autonomy", "no_fetch", "executed" if (res and res.get("executed")) else "error", "low")
                 elif action_type == "WEB_SEARCH":
                     payload = will_result.proposal.get("payload") or {}
                     query = (payload.get("query") or "").strip()
                     if query:
-                        executor_execute_fn(instance_id, [
+                        res = executor_execute_fn(instance_id, [
                             {"action": "WEB_SEARCH", "args": {"query": query}},
                         ])
-                    # commit_end in finally
+                        _ledger("WEB_SEARCH", "autonomy", "no_search", "executed" if (res and res.get("executed")) else "error", "low")
                 # Intent-loop proposals: map to executable PUBLISH_POST or NET_FETCH
                 elif action_type in ("seek_energy", "rest"):
                     if runtime.can_speak() and runtime.spend_speech():
@@ -544,7 +654,7 @@ def run_autonomy_tick(
                             runtime.request_post_cooldown(post_cooldown_seconds)
                             runtime.request_speech_cooldown(5.0)
                 elif action_type == "explore":
-                    url = None
+                    url, query = None, None
                     if isinstance(source_context, str) and source_context.strip():
                         urls = re.findall(r"https?://[\w\-./?&=%#]+", source_context)
                         if urls:
@@ -553,12 +663,27 @@ def run_autonomy_tick(
                         hint = (meaning_state or {}).get("last_medium_hint") or (meaning_state or {}).get("last_medium")
                         if isinstance(hint, str) and hint.startswith(("http://", "https://")):
                             url = hint
-                    if not url:
-                        url = "https://example.com"
-                    if url:
-                        executor_execute_fn(instance_id, [
+                    if not url and not query:
+                        proposal = propose_fetch_or_search_from_environment(
+                            source_context=source_context, meaning_state=meaning_state
+                        )
+                        if proposal:
+                            pt = proposal.get("action_type", "")
+                            payload = proposal.get("payload") or {}
+                            if pt == "NET_FETCH":
+                                url = (payload.get("url") or "").strip()
+                            elif pt == "WEB_SEARCH":
+                                query = (payload.get("query") or "").strip()
+                    if url and url.startswith(("http://", "https://")):
+                        res = executor_execute_fn(instance_id, [
                             {"action": "NET_FETCH", "args": {"url": url}},
                         ])
+                        _ledger("NET_FETCH", "explore", "no_fetch", "executed" if (res and res.get("executed")) else "error", "low")
+                    elif query:
+                        res = executor_execute_fn(instance_id, [
+                            {"action": "WEB_SEARCH", "args": {"query": query}},
+                        ])
+                        _ledger("WEB_SEARCH", "explore", "no_search", "executed" if (res and res.get("executed")) else "error", "low")
                     last_intent_out = "explore"
                 elif action_type == "web_browse":
                     # One-shot browse decision: fetch or search (no interval gate; will kernel already chose to browse)
@@ -578,6 +703,7 @@ def run_autonomy_tick(
                                 executor_execute_fn(instance_id, [{"action": "WEB_SEARCH", "args": {"query": query}}])
                         if life_kernel:
                             life_kernel.last_fetch_decision_tick = delta_t
+                        _ledger(fetch_proposal.get("action_type", "web_browse"), "web_browse", "none", "executed", "low")
                     last_intent_out = "web_browse"
                 elif action_type == "maintain_legacy":
                     if runtime.can_speak() and runtime.spend_speech():
@@ -611,6 +737,13 @@ def run_autonomy_tick(
                             observer_emit(ActionEvent(
                                 instance_id, delta_t, "state_update", False, "error",
                             ))
+                elif action_type in _AUTONOMY_PASSTHROUGH_ACTIONS:
+                    # All patch/capability actions: GITHUB_POST, TRACE_SAVE, FILE_HOST, etc.
+                    payload = will_result.proposal.get("payload") or {}
+                    res = executor_execute_fn(instance_id, [{"action": action_type, "args": payload}])
+                    ok = res and (res.get("published", 0) > 0 or not (res.get("errors") or []))
+                    _ledger(action_type, "autonomy", "passthrough", "executed" if ok else "error", "low")
+                    last_intent_out = action_type
                 # Homeostasis expression: doctrine-driven natural text (textforge)
                 elif textforge and life_kernel and life_state:
                     try:
@@ -762,7 +895,16 @@ def run_autonomy_tick(
                     commit_end()
         return (last_post, last_intent_out)
 
-    if not plan.should_post(confidence_threshold):
+    # Confidence thresholds: >0.8 act immediately; >0.5 quick check then act; else ask only if high-risk. Low-risk never ask.
+    action_label = (plan.intent or "PUBLISH_POST").strip()
+    low_risk = is_low_risk_action(action_label) or is_low_risk_action("publish_post")
+    if low_risk:
+        effective_threshold = 0.0
+    elif plan.confidence < CONFIDENCE_QUICK_CHECK:
+        effective_threshold = 1.0
+    else:
+        effective_threshold = CONFIDENCE_QUICK_CHECK
+    if not plan.should_post(effective_threshold):
         return (last_post, last_intent_out)
 
     if not runtime.can_speak():
@@ -782,6 +924,7 @@ def run_autonomy_tick(
             last_intent_out = plan.intent or "post"
             runtime.request_post_cooldown(post_cooldown_seconds)
             runtime.request_speech_cooldown(5.0)
+            _ledger("PUBLISH_POST", "autonomy", "no_post", "executed", "low")
             if state_update_fn and plan.text and (plan.text or "").strip():
                 try:
                     t = (plan.text or "").strip()[:200]

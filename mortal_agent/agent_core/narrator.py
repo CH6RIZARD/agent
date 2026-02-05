@@ -241,7 +241,9 @@ def generate_narrator_proposal(
                     urls = re.findall(r"https?://[\w\-./?&=%#]+", source_context)
                     if urls:
                         url = urls[0]
-                url = url or "https://example.com"
+                if not url:
+                    # No hardcoded fallback; only propose fetch when URL comes from environment
+                    return None
                 return {
                     "source": "narrator",
                     "action_type": "NET_FETCH",

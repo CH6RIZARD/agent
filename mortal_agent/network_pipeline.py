@@ -92,6 +92,7 @@ def web_search_pipeline(item: Dict[str, Any], instance_id: str) -> Dict[str, Any
 def unified_network_pipeline(item: Dict[str, Any], instance_id: str) -> Dict[str, Any]:
     """
     Single entry point: NET_FETCH -> simple_http_fetch_pipeline, WEB_SEARCH -> web_search_pipeline.
+    Patch actions (GITHUB_POST, TRACE_SAVE, etc.) routed to patches.run_capability.
     Use this as the executor's run_network_pipeline for unrestricted browse + fetch.
     """
     action = item.get("action")
@@ -99,4 +100,11 @@ def unified_network_pipeline(item: Dict[str, Any], instance_id: str) -> Dict[str
         return simple_http_fetch_pipeline(item, instance_id)
     if action == "WEB_SEARCH":
         return web_search_pipeline(item, instance_id)
+    # Route patch actions to patches module
+    try:
+        from mortal_agent.patches import PATCH_ACTIONS, run_capability
+        if action in PATCH_ACTIONS:
+            return run_capability(item, instance_id)
+    except ImportError:
+        pass
     return {"executed": False, "error": "unknown_action"}

@@ -84,6 +84,9 @@ class LifeKernel:
     last_risk_score: float = 0.0
     last_value_score: float = 0.0
     recent_actions: List[str] = field(default_factory=list)
+    # Resource budgeting (RAM only): API calls, time
+    api_call_count: int = 0
+    last_api_call_at: float = 0.0
 
     def update(self, instance_id: str, birth_tick: float, delta_t: float, alive: bool) -> None:
         self.instance_id = instance_id
@@ -190,3 +193,8 @@ class LifeKernel:
             "last_risk": self.last_risk_score,
             "last_value": self.last_value_score,
         }
+
+    def increment_api_call(self) -> None:
+        """Resource budgeting: track API/LLM call. RAM only."""
+        self.api_call_count += 1
+        self.last_api_call_at = time.monotonic()

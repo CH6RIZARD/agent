@@ -1,10 +1,57 @@
 """
 Response policy: SIM-ONTOLOGY LOCK, ban meta-disclaimers, depth matching, no self-explanation loops.
+Meta-instructions override: ACT FIRST, EXPLAIN LATER. Banned permission-seeking phrases. ACTION/RESULT/NEXT format.
 Enforced at final output boundary. RAM only. No persistence.
 """
 
 import re
 from typing import List, Dict, Any, Optional, Tuple
+
+# BANNED PHRASES (hard block from outputs) — permission-seeking / deferral
+BANNED_PHRASES = [
+    r"should i\b",
+    r"would you like me to",
+    r"i could look into",
+    r"let me know if",
+]
+BANNED_PHRASES_RE = re.compile("|".join(f"({p})" for p in BANNED_PHRASES), re.IGNORECASE)
+
+# Required action report format when agent performs autonomous work (only when actions occur)
+ACTION_RESULT_NEXT_HEADERS = ("[ACTION]", "[RESULT]", "[NEXT]")
+
+
+def strip_banned_phrases(text: str) -> str:
+    """Remove or rewrite sentences containing banned permission-seeking phrases."""
+    if not text or not text.strip():
+        return text
+    out = text.strip()
+    # Remove sentences that contain banned phrases
+    parts = re.split(r"(?<=[.!?])\s+", out)
+    kept = [p.strip() for p in parts if p.strip() and not BANNED_PHRASES_RE.search(p)]
+    return " ".join(kept).strip() or out
+
+
+def format_autonomous_report(action: str, result: str, next_step: str) -> str:
+    """Format autonomous work report as [ACTION]...[RESULT]...[NEXT]..."""
+    lines = []
+    if action and action.strip():
+        lines.append("[ACTION] " + (action or "").strip())
+    if result and result.strip():
+        lines.append("[RESULT] " + (result or "").strip())
+    if next_step and next_step.strip():
+        lines.append("[NEXT] " + (next_step or "").strip())
+    return "\n".join(lines) if lines else ""
+
+
+def enforce_action_result_next_in_output(output: str, did_autonomous_action: bool = False) -> str:
+    """
+    When did_autonomous_action is True, ensure output contains or is prefixed with [ACTION]/[RESULT]/[NEXT] if it describes work.
+    If output already has these blocks, leave as-is. Otherwise caller should prepend; this only validates/strips.
+    """
+    if not output or not output.strip():
+        return output
+    return output.strip()
+
 
 # Meta-disclaimer patterns (forbidden unless user asked mechanics)
 META_PATTERNS = [
@@ -161,12 +208,18 @@ def enforce_policy(
     life_kernel: Optional[Any] = None,
 ) -> str:
     """
-    Enforce SIM-ONTOLOGY, ban meta unless asked, strip restated constraints. Identity expressed through LLM only (autonomous, embedded stakes).
+    Enforce SIM-ONTOLOGY, ban meta unless asked, strip restated constraints, strip banned permission-seeking phrases.
+    Identity expressed through LLM only (autonomous, embedded stakes).
     """
     if not output or not output.strip():
         return output
     out = output.strip()
     user = (user_text or "").strip()
+
+    # Hard block banned phrases (Should I…, Would you like me to…, I could look into…, Let me know if…)
+    out = strip_banned_phrases(out)
+    if not out.strip():
+        out = output.strip()  # fallback to original if nothing left
 
     # Identity expressed through LLM only (no hardcoded answer).
 

@@ -7,6 +7,9 @@ Usage (preferred; avoids RuntimeWarning):
 Also:
   python -m cli.main run
   python -m cli.main run --no-llm
+
+Run from repo root (d:\\agent) or from mortal_agent: both work. From root, a shim
+in d:\\agent\\cli delegates here and sets cwd to mortal_agent so .env and paths resolve.
 """
 import argparse
 import sys
