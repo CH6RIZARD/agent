@@ -2,41 +2,29 @@
 LLM reply generation - ANTHROPIC_API_KEY / OPENAI_API_KEY.
 Uses the same API keys as the model you chat with: loads .env from repo root,
 mortal_agent root, user home, and optional AGENT_ENV_PATH (exact path to your .env).
+All calls go through agent_core.llm_router. Primary: Claude (Anthropic); fallback: OpenRouter, OpenAI.
 """
 
-import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
-_root = Path(__file__).parent.parent  # mortal_agent
+_root = Path(__file__).resolve().parent.parent
 _repo = _root.parent
 try:
     from dotenv import load_dotenv
-    # Same keys as the model that responds to you: try all usual places (later overrides earlier)
-    load_dotenv(_repo / ".env")                    # repo root D:\agent\.env
-    load_dotenv(_root / ".env")                    # mortal_agent\.env
-    load_dotenv(Path.home() / ".env")              # user home
+    load_dotenv(_repo / ".env")
+    load_dotenv(_root / ".env")
+    load_dotenv(Path.home() / ".env")
     env_path = os.environ.get("AGENT_ENV_PATH", "").strip()
     if env_path:
         load_dotenv(Path(env_path))
-    load_dotenv()                                   # cwd .env (e.g. when run from mortal_agent/)
+    load_dotenv()
 except ImportError:
     pass
 
-_llm_error_logged = False  # Log unreachable only once per process to avoid spam
-
-try:
-    from anthropic import Anthropic
-except ImportError:
-    Anthropic = None
-
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+_llm_error_logged = False
 
 
 def _ensure_env_loaded() -> None:
@@ -87,7 +75,7 @@ def _load_env_file_keys() -> None:
                     k, v = s.split("=", 1)
                     k = k.strip()
                     v = v.strip()
-                    if k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "OPENAI_MODEL") and v:
+                    if k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_MODEL", "OPENAI_MODEL") and v:
                         # avoid overwriting an existing env var
                         if k not in os.environ or not os.environ.get(k):
                             os.environ[k] = v
@@ -152,86 +140,27 @@ def generate_reply(
     Returns None if no key or error.
     """
     _ensure_env_loaded()
-    if source_context and source_context.strip():
-        try:
-            from .source_loader import get_system_with_source
-            system_prompt = get_system_with_source(system_prompt, source_context)
-        except Exception:
-            pass
-    anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    max_tokens = max(15, min(512, max_tokens))
-
-    errors = []
-
-    # Try OpenAI first; retry on 429 (paid keys can still hit short-term rate limits)
-    if OpenAI is not None and openai_key:
-        openai_model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
-        for attempt in range(1, 4):
-            try:
-                client = OpenAI(api_key=openai_key)
-                r = client.chat.completions.create(
-                    model=openai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_text},
-                    ],
-                    max_tokens=max_tokens,
-                )
-                if r.choices and r.choices[0].message and r.choices[0].message.content:
-                    return r.choices[0].message.content.strip()
-                break
-            except Exception as e:
-                msg = str(e).strip() or type(e).__name__
-                errors.append(f"OpenAI: {type(e).__name__} ({msg[:320]})")
-                is_429 = "429" in msg or "RateLimit" in type(e).__name__ or "rate limit" in msg.lower() or "quota" in msg.lower()
-                if attempt < 3 and is_429:
-                    time.sleep(2.0 * attempt)
-                    continue
-                break
-
-    # Fallback to Anthropic; try multiple model IDs on 404 (model not found)
-    ANTHROPIC_MODEL_IDS = [
-        os.environ.get("ANTHROPIC_MODEL", "").strip(),
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-sonnet-20240620",
-        "claude-3-opus-20240229",
-        "claude-3-sonnet-20240229",
-    ]
-    if Anthropic is not None and anthropic_key:
-        for model_id in ANTHROPIC_MODEL_IDS:
-            if not model_id:
-                continue
-            try:
-                client = Anthropic(api_key=anthropic_key)
-                r = client.messages.create(
-                    model=model_id,
-                    max_tokens=max_tokens,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_text}],
-                )
-                if r.content and len(r.content) > 0 and getattr(r.content[0], "text", None):
-                    return r.content[0].text.strip()
-            except Exception as e:
-                msg = str(e).strip() or type(e).__name__
-                errors.append(f"Anthropic: {type(e).__name__} ({msg[:320]})")
-                if "404" in msg or "NotFound" in type(e).__name__:
-                    continue
-                break
-
-    if errors:
-        out = f"[LLM error: {errors[0]}]"
-        if anthropic_key and openai_key:
-            out += " (Both Anthropic and OpenAI failed.)"
-        elif anthropic_key:
-            out += " (OPENAI_API_KEY is empty in .env — put your full key on the same line as OPENAI_API_KEY= with no line break.)"
-        elif openai_key:
-            out += " (Anthropic not loaded; set ANTHROPIC_API_KEY in .env and restart.)"
-        _log_llm_error_once(out, anthropic_len=len(anthropic_key), openai_len=len(openai_key))
-        return out
-    no_llm = "[No LLM configured - set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env]"
-    _log_llm_error_once(no_llm, anthropic_len=len(anthropic_key), openai_len=len(openai_key))
-    return no_llm
+    try:
+        from .llm_router import generate_reply_routed
+    except ImportError:
+        _log_llm_error_once("[No LLM router - install agent_core.llm_router]", 0, 0)
+        return "[No LLM configured - set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env]"
+    reply, failure = generate_reply_routed(
+        user_text,
+        system_prompt,
+        max_tokens=max(15, min(512, max_tokens)),
+        source_context=source_context,
+        provider_mode="auto",
+        failover=True,
+        no_llm=False,
+    )
+    if reply:
+        return reply
+    if failure:
+        detail = (failure.get("detail") or "no response")[:200]
+        _log_llm_error_once(detail, 0, 0)
+        return f"[LLM error: {detail}]"
+    return "[LLM error: no response]"
 
 
 def _log_llm_error_once(message: str, anthropic_len: int = 0, openai_len: int = 0) -> None:
@@ -241,7 +170,7 @@ def _log_llm_error_once(message: str, anthropic_len: int = 0, openai_len: int = 
         return
     try:
         print(f"[agent] LLM unreachable: {message}", file=sys.stderr)
-        print(f"[agent] Keys seen: ANTHROPIC_API_KEY={anthropic_len} chars, OPENAI_API_KEY={openai_len} chars", file=sys.stderr)
+        print(f"[agent] Keys: ANTHROPIC={anthropic_len} chars, OPENAI={openai_len} chars", file=sys.stderr)
         _llm_error_logged = True
     except Exception:
         pass

@@ -208,7 +208,7 @@ def generate_internal_proposals(
                 "risk": 0.20,
             })
 
-    # RELAXED + HEALTHY: Can explore and browse (fetch/search chosen by will kernel or autonomy fetch prompt)
+    # RELAXED + HEALTHY: Can explore, browse, or choose which autonomy actions run next (meta-action)
     if relaxed and not energy_low and not hazard_moderate:
         proposals.append({
             "source": "internal",
@@ -223,6 +223,19 @@ def generate_internal_proposals(
             "payload": {},
             "expected_dt_impact": 0.60,
             "risk": 0.20,
+        })
+        # Meta-action: choose which autonomous actions run next (queue; RAM-only, no persistence)
+        goal_hint = (meaning_state or {}).get("meaning_goal") or "discover_self"
+        proposals.append({
+            "source": "internal",
+            "action_type": "SELECT_AUTONOMY_ACTIONS",
+            "payload": {
+                "actions": [
+                    {"action": "WEB_SEARCH", "args": {"query": str(goal_hint)[:200]}},
+                ],
+            },
+            "expected_dt_impact": 0.55,
+            "risk": 0.15,
         })
         proposals.append({
             "source": "internal",

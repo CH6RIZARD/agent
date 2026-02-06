@@ -3,12 +3,23 @@ Autonomy capability patches: research, world interaction, cognitive architecture
 autonomous operation, and learning. No hard-coded triggers—agent decides when to use
 based on goals/context. Signed and immersively emergent.
 
+Invariants (no autonomy action may violate): no changing persistence, no respawn,
+no memory across states. New API integration is config-only (REGISTER_API →
+state/api_registry.json); agent does not edit Python to wire APIs.
+
 All patch actions are enabled for CLI/main run. Individual patches may still require
 env vars (e.g. GITHUB_TOKEN, FILE_HOST_API_KEY) and will return executed: False with
 error if not configured.
 """
 
+import os
 from typing import Dict, Any, Optional
+
+
+def _is_deploy() -> bool:
+    """True when MORTAL_DEPLOY is set (deploy mode). When False, patch actions return deploy_only."""
+    v = (os.environ.get("MORTAL_DEPLOY") or "").strip().lower()
+    return v in ("1", "true", "yes", "on", "deploy")
 
 # Patch action names (executor + pipeline route these)
 ACTION_WEB_SCRAPE = "WEB_SCRAPE"
@@ -27,6 +38,7 @@ ACTION_TRACE_SAVE = "TRACE_SAVE"
 ACTION_TRACE_READ = "TRACE_READ"
 ACTION_REGISTER_API = "REGISTER_API"
 ACTION_REGISTRY_READ = "REGISTRY_READ"
+ACTION_SELECT_AUTONOMY_ACTIONS = "SELECT_AUTONOMY_ACTIONS"
 
 _ALL_PATCH_ACTIONS = frozenset({
     ACTION_WEB_SCRAPE,
@@ -45,6 +57,7 @@ _ALL_PATCH_ACTIONS = frozenset({
     ACTION_TRACE_READ,
     ACTION_REGISTER_API,
     ACTION_REGISTRY_READ,
+    ACTION_SELECT_AUTONOMY_ACTIONS,
 })
 
 # All patches enabled for CLI/main run
@@ -57,9 +70,10 @@ def run_capability(item: Dict[str, Any], instance_id: str) -> Dict[str, Any]:
     Returns {"executed": bool, ...} with optional "error", "body", etc.
     Live only on deploy: when MORTAL_DEPLOY is not set, returns deploy_only (no memory persisted after death).
     """
-    if not _is_deploy():
-        return {"executed": False, "error": "deploy_only"}
     action = (item.get("action") or "").strip()
+    # SELECT_AUTONOMY_ACTIONS allowed without deploy (no persistence/respawn/memory)
+    if not _is_deploy() and action not in (ACTION_SELECT_AUTONOMY_ACTIONS,):
+        return {"executed": False, "error": "deploy_only"}
     args = item.get("args") or {}
     if action not in _ALL_PATCH_ACTIONS:
         return {"executed": False, "error": f"unknown_patch_action:{action}"}
@@ -112,6 +126,9 @@ def run_capability(item: Dict[str, Any], instance_id: str) -> Dict[str, Any]:
         if action == ACTION_REGISTRY_READ:
             from .api_registry import run_registry_read
             return run_registry_read(args, instance_id)
+        if action == ACTION_SELECT_AUTONOMY_ACTIONS:
+            from .autonomy_choice import run_select_autonomy_actions
+            return run_select_autonomy_actions(args, instance_id)
     except Exception as e:
         return {"executed": False, "error": str(e)}
     return {"executed": False, "error": "patch_not_implemented"}

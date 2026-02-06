@@ -273,6 +273,7 @@ class MortalAgent:
             self._motivation = None
         self._birth_action_log = {}
         self._last_silence_entropy_check = 0.0
+        self._last_meaning_reflection_tick = 0.0
         # load persisted state if exists
         try:
             self._load_persistent_state()
@@ -300,6 +301,8 @@ class MortalAgent:
 
     BIRTH_ENTROPY_THRESHOLD = 0.25
     SILENCE_ENTROPY_INTERVAL = 25.0
+    MEANING_REFLECTION_INTERVAL = 60.0   # run reflection at most every this many delta_t seconds
+    MEANING_REFLECTION_TENSION_THRESHOLD = 0.5  # or when meaning_tension exceeds this
 
     def _entropy_birth(self) -> float:
         """Environment entropy at birth: no memory, unknown world, tools available, time advancing."""
@@ -772,6 +775,80 @@ class MortalAgent:
         with self._state_lock:
             self._meaning_state["meaning_tension"] = self._clamp01(tension)
 
+    def _run_meaning_reflection(self) -> Optional[Dict[str, Any]]:
+        """Ask the LLM to rephrase/refine meaning_goal, meaning_questions, meaning_hypotheses.
+        Returns a payload suitable for _apply_state_update, or None on failure/offline.
+        Does not set meaning_tension or meaning_progress (those stay programmatic).
+        """
+        if self._no_llm:
+            return None
+        with self._state_lock:
+            ms = dict(self._meaning_state) if self._meaning_state else {}
+        goal = (ms.get("meaning_goal") or "discover_self").strip()[:200]
+        qs = list(ms.get("meaning_questions") or [])[-5:]
+        hs = list(ms.get("meaning_hypotheses") or [])[-5:]
+        metaphor = (ms.get("core_metaphor") or "").strip()[:200]
+        axioms = list(ms.get("axioms") or [])[-5:]
+        system = (
+            "You are reflecting on your current sense of meaning. Output only a single JSON object, no other text. "
+            "Keys: meaning_goal (string, short), meaning_questions (array of strings), meaning_hypotheses (array of strings), "
+            "optional core_metaphor (string), optional axioms (array of strings). "
+            "Rephrase and merge for clarity; keep the spirit of self-discovery. Stay within discover_self / explore / consolidate. "
+            "Do not set meaning_tension or meaning_progress."
+        )
+        user_parts = [f"Current meaning_goal: {goal}"]
+        if qs:
+            user_parts.append("Recent meaning_questions:\n" + "\n".join(f"- {q[:150]}" for q in qs))
+        if hs:
+            user_parts.append("Recent meaning_hypotheses:\n" + "\n".join(f"- {h[:150]}" for h in hs))
+        if metaphor:
+            user_parts.append(f"Current core_metaphor: {metaphor}")
+        if axioms:
+            user_parts.append("Current axioms: " + "; ".join(a[:80] for a in axioms))
+        user_parts.append("\nOutput one JSON object with meaning_goal, meaning_questions, meaning_hypotheses, and optionally core_metaphor, axioms.")
+        user_text = "\n\n".join(user_parts)
+        try:
+            if self._life_kernel is not None:
+                self._life_kernel.increment_api_call()
+            from .llm_router import generate_reply_routed
+            reply, _ = generate_reply_routed(
+                user_text,
+                system,
+                max_tokens=500,
+                provider_mode=getattr(self, "_provider_mode", "auto"),
+                timeout_s=getattr(self, "_llm_timeout", 30.0),
+                retries=getattr(self, "_llm_retries", 2),
+                failover=getattr(self, "_llm_failover", True),
+                no_llm=False,
+            )
+        except Exception:
+            return None
+        if not reply or not isinstance(reply, str):
+            return None
+        raw = reply.strip()
+        # Strip markdown code block if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        payload = {}
+        if "meaning_goal" in data and isinstance(data["meaning_goal"], str):
+            payload["meaning_goal"] = (data["meaning_goal"] or "discover_self").strip()[:80]
+        if "meaning_questions" in data and isinstance(data["meaning_questions"], list):
+            payload["meaning_questions"] = [str(x).strip()[:200] for x in data["meaning_questions"] if x][:10]
+        if "meaning_hypotheses" in data and isinstance(data["meaning_hypotheses"], list):
+            payload["meaning_hypotheses"] = [str(x).strip()[:200] for x in data["meaning_hypotheses"] if x][:20]
+        if "core_metaphor" in data and isinstance(data["core_metaphor"], str) and data["core_metaphor"].strip():
+            payload["core_metaphor"] = data["core_metaphor"].strip()[:120]
+        if "axioms" in data and isinstance(data["axioms"], list):
+            payload["axioms"] = [str(x).strip()[:100] for x in data["axioms"] if x][:5]
+        return payload if payload else None
+
     def wander_step(self, docs: Optional[str] = None, trigger_medium: str = "system") -> Dict[str, Any]:
         """Perform one bounded WANDER_STEP.
         Tied to narrator: uses narrator state to filter response.
@@ -1149,7 +1226,7 @@ class MortalAgent:
                                 f.write(f"doc_used={1 if use_docs else 0}\n")
                     except Exception:
                         pass
-                    llm_reply, _ = generate_reply_routed(
+                    llm_reply, failure = generate_reply_routed(
                         user_prompt,
                         system,
                         max_tokens=280,
@@ -1162,6 +1239,10 @@ class MortalAgent:
                     )
                     if llm_reply and (llm_reply or "").strip():
                         reply = (llm_reply or "").strip()
+                        reply_from_llm = True
+                    elif failure:
+                        detail = (failure.get("detail") or "")[:200]
+                        reply = f"[LLM error: {detail}]"
                         reply_from_llm = True
                 except Exception:
                     pass
@@ -1391,10 +1472,15 @@ class MortalAgent:
         def _apply_state_update(payload: dict) -> None:
             try:
                 # merge allowed keys into meaning_state and persist. last_autonomous_message is NOT accepted here (single write path only).
+                # meaning_tension and meaning_progress are never accepted (programmatic only).
                 with self._state_lock:
                     for k, v in (payload or {}).items():
                         if k in ("meaning_goal", "core_metaphor", "axioms", "last_medium_hint"):
                             self._meaning_state[k] = v
+                        if k == "meaning_questions" and isinstance(v, list):
+                            self._meaning_state["meaning_questions"] = [str(x).strip()[:200] for x in v if x][:10]
+                        if k == "meaning_hypotheses" and isinstance(v, list):
+                            self._meaning_state["meaning_hypotheses"] = [str(x).strip()[:200] for x in v if x][:20]
                         if k == "meaning_hypotheses_append" and v and isinstance(v, str):
                             hs = self._meaning_state.get("meaning_hypotheses", [])
                             hs.append(v[:200])
@@ -1509,6 +1595,19 @@ class MortalAgent:
                     self._ram_memory.tick_and_maybe_replay(self._identity.delta_t)
                 if self._goal_hierarchy is not None:
                     self._goal_hierarchy.set_tick(self._identity.delta_t)
+            except Exception:
+                pass
+            # Meaning reflection: LLM rephrases/refines goal, questions, hypotheses on schedule or when tension high
+            try:
+                last_reflect = getattr(self, "_last_meaning_reflection_tick", 0.0)
+                tension = float(self._meaning_state.get("meaning_tension", 0.0))
+                interval_ok = (self._identity.delta_t - last_reflect) >= self.MEANING_REFLECTION_INTERVAL
+                tension_ok = tension >= self.MEANING_REFLECTION_TENSION_THRESHOLD
+                if interval_ok or tension_ok:
+                    payload = self._run_meaning_reflection()
+                    if payload:
+                        _apply_state_update(payload)
+                    self._last_meaning_reflection_tick = self._identity.delta_t
             except Exception:
                 pass
             # Autonomy tick: survival-aware intent_loop -> will kernel -> action commit -> execute

@@ -108,6 +108,7 @@ except Exception:
     _AUTONOMY_PASSTHROUGH_ACTIONS = frozenset({
         "GITHUB_POST", "TRACE_SAVE", "TRACE_READ", "FILE_HOST", "FORM_SUBMIT",
         "CLOUD_SPINUP", "CODE_REPO", "PAYMENT", "REGISTER_API", "REGISTRY_READ",
+        "SELECT_AUTONOMY_ACTIONS",
     })
 
 _AUTONOMY_FETCH_PROMPT_PATH = Path(__file__).resolve().parent.parent / "templates" / "autonomy_fetch.md"
@@ -430,6 +431,47 @@ def run_autonomy_tick(
         return (last_post, last_intent_out)
 
     if life_state and select_action and generate_internal_proposals:
+        # Meta-action: run a previously chosen autonomy action (SELECT_AUTONOMY_ACTIONS queue)
+        try:
+            from .selected_actions_queue import pop as pop_selected_action
+            selected = pop_selected_action(instance_id)
+            if selected:
+                action_type = (selected.get("action_type") or "").strip()
+                payload = selected.get("payload") or {}
+                if action_type and commit_begin("selected_action"):
+                    try:
+                        if action_type == "PUBLISH_POST":
+                            text = (payload.get("text") or "").strip()
+                            if text and runtime.can_speak() and runtime.spend_speech():
+                                result = executor_execute_fn(instance_id, [
+                                    {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(text), "channel": "moltbook"}},
+                                ])
+                                if result.get("published", 0) > 0:
+                                    last_post = delta_t
+                                    last_intent_out = action_type
+                                    runtime.request_post_cooldown(post_cooldown_seconds)
+                                    runtime.request_speech_cooldown(5.0)
+                                    if life_kernel:
+                                        life_kernel.set_last_action(action_type)
+                                    if record_last_autonomous_message_fn and text:
+                                        try:
+                                            record_last_autonomous_message_fn(text[:200])
+                                        except Exception:
+                                            pass
+                            _ledger("PUBLISH_POST", "selected_action", "none", "executed", "low")
+                        else:
+                            res = executor_execute_fn(instance_id, [{"action": action_type, "args": payload}])
+                            ok = res and (res.get("published", 0) > 0 or res.get("executed") or not (res.get("errors") or []))
+                            _ledger(action_type, "selected_action", "none", "executed" if ok else "error", "low")
+                            last_intent_out = action_type
+                            if life_kernel:
+                                life_kernel.set_last_action(action_type)
+                    finally:
+                        commit_end()
+                return (last_post, last_intent_out)
+        except Exception:
+            pass
+
         proposals = list(generate_internal_proposals(life_state, delta_t, last_intent))
         # Narrator may optionally propose low-risk actions
         if generate_narrator_proposal and meaning_state is not None:

@@ -22,14 +22,12 @@ def main():
 
     _ensure_env_loaded()
     import os
+    anth_len = len((os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or "").strip())
     openai_len = len((os.environ.get("OPENAI_API_KEY") or "").strip())
-    anth_len = len((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
     print(f"[verify] Keys: ANTHROPIC={anth_len} chars, OPENAI={openai_len} chars")
-    if openai_len == 0 and anth_len == 0:
-        print("[verify] FAIL: No API keys. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env (one line each, no line break after =).")
+    if anth_len == 0 and openai_len == 0:
+        print("[verify] FAIL: No API keys. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env (one line each, no line break after =).")
         return 1
-    if openai_len == 0:
-        print("[verify] OPENAI_API_KEY is empty in .env — put your full key on the SAME line as OPENAI_API_KEY= with no line break.")
 
     # Minimal identity-style system prompt (agent draws from this; no hardcoded answers)
     system = (

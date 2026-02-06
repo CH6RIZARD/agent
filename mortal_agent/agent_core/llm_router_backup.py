@@ -18,7 +18,7 @@ import requests
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 
-_root = Path(__file__).resolve().parent.parent  # mortal_agent
+_root = Path(__file__).parent.parent  # mortal_agent
 _repo = _root.parent
 
 # Load .env: cwd, repo, project, home, AGENT_ENV_PATH, then external keys/.env (overrides)
@@ -239,7 +239,7 @@ def _try_anthropic(
     max_tokens: int,
     timeout_s: float,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Try Anthropic API. Returns (reply, failure_info). Primary for chat/identity."""
+    """Try Anthropic API. Returns (reply, failure_info). Fallback only."""
     anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or "").strip()
     if not anthropic_key:
         return None, {"provider": "anthropic", "code": "auth", "detail": "ANTHROPIC_API_KEY not set"}
@@ -437,9 +437,8 @@ def generate_plan_routed(
     max_tokens = max(15, min(512, max_tokens))
     last_failure = None
 
-    # Planner: try Claude (Anthropic) first when in auto mode (use same keys as .env)
-    _anth_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or "").strip()
-    if provider_mode == "auto" and _anth_key:
+    # Planner: try Claude (Anthropic) first when in auto mode
+    if provider_mode == "auto" and ANTHROPIC_KEY:
         for attempt in range(retries + 1):
             if _LOG_KEYS and attempt == 0:
                 try:
@@ -467,8 +466,7 @@ def generate_plan_routed(
             break
 
     # Then try Groq for speed
-    _groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
-    if provider_mode == "auto" and _groq_key:
+    if provider_mode == "auto" and GROQ_KEY:
         for attempt in range(retries + 1):
             if _LOG_KEYS and attempt == 0:
                 try:

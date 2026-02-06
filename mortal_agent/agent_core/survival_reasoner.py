@@ -386,25 +386,23 @@ def reason_with_llm(
         actions_list=actions_list,
     )
 
+    response, failure_info = generate_plan_routed(
+        prompt,
+        max_tokens=150,
+        provider_mode=provider_mode,
+        timeout_s=timeout,
+        retries=1,
+        failover=True,
+        no_llm=False,
+    )
+
+    if not response:
+        return None
+
     try:
-        response, failure_info = generate_plan_routed(
-            prompt,
-            max_tokens=150,
-            provider_mode=provider_mode,
-            timeout_s=timeout,
-            retries=1,
-            failover=True,
-            no_llm=False,
-        )
-
-        if not response:
-            return None
-
         # Parse JSON response
-        # Try to extract JSON from response
         response = response.strip()
         if response.startswith("```"):
-            # Remove markdown code blocks
             lines = response.split("\n")
             response = "\n".join(l for l in lines if not l.startswith("```"))
 
@@ -414,7 +412,6 @@ def reason_with_llm(
         reason = data.get("reason", "llm_decision")
         consideration = data.get("survival_consideration", "")
 
-        # Find matching proposal
         matching = None
         for p in proposals:
             p_type = p.get("action_type") or p.get("action", "")
@@ -423,10 +420,8 @@ def reason_with_llm(
                 break
 
         if not matching:
-            # LLM chose action not in proposals - fall back
             return None
 
-        # Compute scores for the chosen action
         risk = compute_action_risk(matching, life_state, time_pressure)
         value = compute_action_value(matching, meaning_state, time_pressure, life_state)
         utility = compute_utility(value, risk, time_pressure)
@@ -441,7 +436,6 @@ def reason_with_llm(
             value_score=value,
             utility=utility,
         )
-
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
     except Exception:

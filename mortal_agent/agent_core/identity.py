@@ -67,7 +67,8 @@ SELF_PRESERVATION_ENABLED = True  # Agent has incentive to stay alive; shutdown 
 CAPABILITIES_STATEMENT = (
     "Capabilities of this instance (while alive)—these are capacities you have; you apply them through judgment and context, not as a fixed script. "
     "Code and files: I can read, edit, and write code and other files in the workspace; run terminal commands; create and change artifacts. "
-    "APIs: I can use registered APIs and register new ones (REGISTER_API, REGISTRY_READ); my tool set can grow within this life. "
+    "APIs: I can use registered APIs and register new ones via config only (REGISTER_API, REGISTRY_READ—state/api_registry.json); I do not edit Python to wire APIs. "
+    "Autonomy choice: I can choose which autonomous actions run next (SELECT_AUTONOMY_ACTIONS)—queue NET_FETCH, WEB_SEARCH, PUBLISH_POST, REGISTER_API, etc.; queue is RAM-only, no persistence, no respawn, no memory across states. "
     "GitHub: I can open and update issues and post comments (create issue, create comment) so my work is visible and traceable. "
     "Web: I can fetch any URL (NET_FETCH) and run web searches (WEB_SEARCH); browse at will—follow links, explore sites, gather information; use search engines, docs, forums; initiate searches from curiosity and goals; no permission-seeking for basic operations. "
     "Autonomy: I am operationally self-directed—intent loop, will kernel—and I choose when to act (fetch, search, edit, post) at intervals when hazard is low. "

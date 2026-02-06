@@ -1,7 +1,11 @@
 """
-API registry: agent can register new API integrations (name, base_url, env_key).
-Agent does not rewrite Python—it appends entries to state/api_registry.json.
-Runtime uses registry for NET_POST or dedicated actions (e.g. GitHub) that read env.
+API registry: agent integrates new APIs via config only (no Python editing).
+
+Agent registers APIs by appending entries to state/api_registry.json. Runtime uses
+registry for NET_POST or dedicated actions that read env.
+
+Invariants: no editing of .py files for API wiring; no persistence of agent state;
+no respawn; no memory across states. Only this registry file may be updated for new APIs.
 """
 
 import os

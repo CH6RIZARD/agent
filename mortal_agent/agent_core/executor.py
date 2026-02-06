@@ -31,7 +31,8 @@ class Executor:
                 ok, err = self._execute_publish_post(instance_id, args, result)
                 if not ok and err:
                     result["errors"].append(err)
-            elif action in (ACTION_NET_FETCH, ACTION_WEB_SEARCH) and self._run_network_pipeline:
+            elif self._run_network_pipeline:
+                # NET_FETCH, WEB_SEARCH, and all patch actions (REGISTER_API, GITHUB_POST, etc.)
                 r = self._run_network_pipeline(item, instance_id)
                 if not r.get("executed") and r.get("error"):
                     result["errors"].append(r.get("error", "network_failed"))
