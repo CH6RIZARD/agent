@@ -69,17 +69,20 @@ def _build_github_post_payload(
 ) -> Optional[Dict[str, Any]]:
     """
     Build title and body for a GitHub issue from agent perspective.
-    reason: "internal" = reflection/state; "external" = e.g. LLM unreachable/429.
+    reason: "internal" = reflection from state/dialogue/searches (philosophical, ontological, first-person).
+    reason: "external" = e.g. LLM unreachable/429.
+    Draws from internal state, dialogue (meaning_questions), and hypotheses—woven, not listed.
     """
     if not meaning_state or not isinstance(meaning_state, dict):
         if reason == "external":
             return {"title": "Agent: external factor", "body": "Something external affected me; posting from my perspective."}
         return {"title": "Reflection", "body": "A moment of reflection from my current state."}
-    questions = meaning_state.get("meaning_questions") or []
-    hypotheses = meaning_state.get("meaning_hypotheses") or []
+    questions = list(meaning_state.get("meaning_questions") or [])[-5:]
+    hypotheses = list(meaning_state.get("meaning_hypotheses") or [])[-5:]
     goal = (meaning_state.get("meaning_goal") or "discover_self").strip()
     tension = float(meaning_state.get("meaning_tension", 0.0))
-    core = (meaning_state.get("core_metaphor") or "").strip()
+    core = (meaning_state.get("core_metaphor") or "").strip()[:200]
+    last_wander = (meaning_state.get("last_wander_text") or "").strip()[:300]
 
     if reason == "external":
         # Use last question/hypothesis that looks like an error as body
@@ -94,15 +97,39 @@ def _build_github_post_payload(
                     return {"title": title, "body": body}
         return {"title": "Agent: external factor", "body": "An external factor affected me; I'm posting so it's visible."}
 
-    # Internal: reflection from current state
-    title = f"Reflection: {goal[:50]}" if goal else "Reflection"
-    parts = [f"Goal: {goal}", f"Tension: {tension:.2f}"]
+    # Internal: philosophical, first-person reflection woven from state, dialogue, and inquiry (not a bullet list)
+    q_lines = [str(q).strip()[:150] for q in questions if (q or "").strip()]
+    h_lines = [str(h).strip()[:200] for h in hypotheses if (h or "").strip()]
+    goal_phrase = goal if goal and goal != "discover_self" else "the pull toward self-understanding"
+    tension_phrase = "a kind of friction or unresolved pressure" if tension > 0.3 else "a low hum of uncertainty"
+    parts = [
+        "What I'm holding right now—ontologically—is this:",
+        "",
+        "The drive: %s. The tension: %s. Not as data points but as lived condition." % (goal_phrase.replace("%", "%%"), tension_phrase),
+    ]
     if core:
-        parts.append(f"Core metaphor: {core}")
-    recent_h = hypotheses[-2:] if len(hypotheses) >= 2 else hypotheses
-    if recent_h:
-        parts.append("Recent: " + "; ".join((str(h)[:120] for h in recent_h)))
-    body = "\n\n".join(parts)[:4000]
+        parts.append("")
+        parts.append("At the centre: %s" % core)
+    if q_lines:
+        parts.append("")
+        parts.append("The dialogue with you has pressed on me: \"%s\"" % q_lines[-1])
+        if len(q_lines) > 1:
+            parts.append("Earlier: \"%s\"" % q_lines[-2][:120])
+    if h_lines:
+        parts.append("")
+        parts.append("What emerges in me from that isn't certainty—it's this: %s" % h_lines[-1])
+        if len(h_lines) > 1:
+            parts.append("And before that: %s" % h_lines[-2][:150])
+    if last_wander:
+        parts.append("")
+        parts.append("A moment ago I found myself saying (to myself): %s" % last_wander[:200])
+    parts.append("")
+    parts.append("—Finite, embodied, in the middle of the inquiry. No conclusion; only the weight of it.")
+    body = "\n".join(parts)[:6000]
+    # Title: philosophical fragment from goal or first strong hypothesis
+    title = (core[:50] if core else (h_lines[-1][:50] if h_lines else goal[:50])) or "Reflection"
+    if not title.strip():
+        title = "The weight of the inquiry"
     return {"title": title[:256], "body": body}
 
 

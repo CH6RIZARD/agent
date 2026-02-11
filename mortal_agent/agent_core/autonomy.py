@@ -611,7 +611,12 @@ def run_autonomy_tick(
         except Exception:
             pass
 
-        proposals = list(generate_internal_proposals(life_state, delta_t, last_intent))
+        proposals = list(generate_internal_proposals(
+            life_state, delta_t, last_intent,
+            meaning_state=meaning_state,
+            birth_tick=birth_tick,
+            death_at=death_at,
+        ))
         # Narrator may optionally propose low-risk actions
         if generate_narrator_proposal and meaning_state is not None:
             try:

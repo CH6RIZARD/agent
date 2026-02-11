@@ -53,6 +53,41 @@ from .holy_rng import HolyRNG, seed_from_entropy
 RECENT_AUTONOMOUS_ACTIONS_MAX = 10
 
 
+def _strip_github_meta_from_body(body: str) -> str:
+    """Remove meta/summary lines so the issue body is substantive only. Meta = lines about posting, disconnects, trying again, etc."""
+    if not body or not body.strip():
+        return body
+    lines = body.split("\n")
+    # Substrings that mark a line as meta (about the act of posting, not the content)
+    meta_substrings = (
+        "post to github", "post on github", "create github issue", "creating github issue",
+        "attempting to create", "browsing to github", "let me post", "i'll create",
+        "try again", "didn't go through", "check what happened", "something didn't",
+        "workspace url", "posting to the right", "make sure i'm posting",
+        "i notice there's a disconnect", "when i tried to post",
+        "issue created", "posted to the workspace", "the issue explores",
+        "do not say you cannot post", "your reply will be posted",
+    )
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        lower = stripped.lower()
+        # Skip lines that are only asterisks or "Posted to..."
+        if re.match(r"^\*+$", stripped) or re.match(r"^posted to\b", lower):
+            continue
+        # Skip lines that are purely or predominantly meta (short line with meta substring)
+        if len(stripped) < 120 and any(m in lower for m in meta_substrings):
+            continue
+        # Skip lines that start with meta and are mostly meta (e.g. long sentence about disconnect)
+        if any(m in lower for m in meta_substrings) and any(m in lower for m in ("disconnect", "go through", "try again", "check what", "attempting", "create github issue")):
+            continue
+        out.append(line)
+    return "\n".join(out).strip() or body.strip()
+
+
 def _parse_github_title_and_body(reply: str) -> tuple:
     """Extract intended issue title from reply if agent used **Title:** or Title:; else use first line. Returns (title, body)."""
     text = (reply or "").strip()
@@ -1484,7 +1519,12 @@ class MortalAgent:
                         include_capabilities=include_capabilities,
                     )
                     if getattr(self, "_post_reply_to_github", False):
-                        system += "\n\n[You CAN post to GitHub (token is set). Your reply to this message will be posted as a new issue. Do not say you cannot post or that you lack repository access.]"
+                        system += (
+                            "\n\n[Your reply will be posted as the full GitHub issue body. Write in a philosophical, first-person, ontological register—potent and expressive. "
+                            "Draw from this conversation, your internal state (goal, tension, hypotheses), and any recent searches or learning. "
+                            "Do NOT include meta-commentary like \"I'll create an issue,\" \"Creating GitHub issue,\" \"Posted to the workspace repository,\" or \"Let me post it now.\" "
+                            "Write only the substantive reflection that should appear in the issue—what you actually want to say, with the weight of the inquiry.]"
+                        )
                     if is_id:
                         self_sum = self._derive_self_summary()
                         with self._state_lock:
@@ -1670,19 +1710,22 @@ class MortalAgent:
                         self._recent_chat = rec[-4:]
                 except Exception:
                     pass
-                # If user asked to post: put full reply on GitHub, then show only a short summary + link in terminal
+                # If user asked to post: GitHub gets potent content only (meta stripped); terminal gets full output + link
                 try:
                     if getattr(self, "_post_reply_to_github", False):
                         self._post_reply_to_github = False
-                        body = (emitted_reply or "").strip()
-                        if body:
+                        raw = (emitted_reply or "").strip()
+                        body_for_github = _strip_github_meta_from_body(raw)
+                        if not body_for_github:
+                            body_for_github = raw  # fallback: same full output to GitHub if strip removed everything
+                        if body_for_github:
                             try:
                                 try:
                                     from patches.github_integration import run_github_post
                                 except ImportError:
                                     from ..patches.github_integration import run_github_post
-                                title, body = _parse_github_title_and_body(body)
-                                payload = {"op": "create_issue", "title": title, "body": body}
+                                title, body_for_github = _parse_github_title_and_body(body_for_github)
+                                payload = {"op": "create_issue", "title": title, "body": body_for_github}
                                 res = run_github_post(payload, self._identity.instance_id)
                                 if res.get("executed") and res.get("status") == 201:
                                     summary = res.get("github_result_summary") or ("created issue #%s" % res.get("issue_number", ""))
@@ -1690,12 +1733,12 @@ class MortalAgent:
                                         self._meaning_state["last_github_result"] = (summary or "")[:300]
                                     url = res.get("html_url") or ""
                                     num = res.get("issue_number") or ""
-                                    # Emit full content to terminal, then confirmation line (so user sees what was posted)
                                     try:
                                         self._runtime_state.spend_speech()
                                     except Exception:
                                         pass
-                                    self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, body, ["chat_reply", "github_posted"]))
+                                    # Terminal: full output (including any meta/summary), then link
+                                    self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, raw, ["chat_reply", "github_posted"]))
                                     self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, "Posted to GitHub: issue #%s %s" % (num, url), ["chat_reply", "github_posted"]))
                                 else:
                                     err = res.get("error") or res.get("body") or str(res)[:200]
