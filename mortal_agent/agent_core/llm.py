@@ -10,36 +10,44 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_root = Path(__file__).resolve().parent.parent
-_repo = _root.parent
-try:
-    from dotenv import load_dotenv
-    load_dotenv(_repo / ".env")
-    load_dotenv(_root / ".env")
+_root = Path(__file__).resolve().parent.parent  # mortal_agent
+_repo = _root.parent  # repo root (parent of mortal_agent)
+
+
+def load_agent_env() -> None:
+    """Auto-load .env from repo: mortal_agent/.env, repo root .env, cwd, home, AGENT_ENV_PATH, keys/.env.
+    Safe to call multiple times. Call early so OPENAI_API_KEY etc. are set regardless of cwd.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _load_env_file_keys()
+        return
+    # Order: project and repo first so they're always loaded; then cwd/home override; then explicit path wins
+    load_dotenv(_root / ".env")   # mortal_agent/.env (from package location)
+    load_dotenv(_repo / ".env")  # repo root .env
+    load_dotenv(Path.cwd() / ".env")
     load_dotenv(Path.home() / ".env")
     env_path = os.environ.get("AGENT_ENV_PATH", "").strip()
     if env_path:
         load_dotenv(Path(env_path))
-    load_dotenv()
-except ImportError:
-    pass
+    load_dotenv()  # default .env in cwd
+    for keys_dir in (Path.cwd() / "keys", _root / "keys", _repo / "keys"):
+        keys_env = keys_dir / ".env"
+        if keys_env.exists():
+            load_dotenv(dotenv_path=keys_env)
+            break
+
+
+# Run once at import so any import of agent_core.llm loads .env from repo
+load_agent_env()
 
 _llm_error_logged = False
 
 
 def _ensure_env_loaded() -> None:
-    """Re-load .env so keys are set. Uses AGENT_ENV_PATH, mortal_agent/.env, then cwd."""
-    # Prefer python-dotenv when available; otherwise fall back to a simple .env parser
-    try:
-        from dotenv import load_dotenv
-        env_path = os.environ.get("AGENT_ENV_PATH", "").strip()
-        if env_path:
-            load_dotenv(Path(env_path))
-        load_dotenv(_root / ".env")
-        load_dotenv()
-    except Exception:
-        # Try to load key/value pairs from common .env locations even without python-dotenv
-        _load_env_file_keys()
+    """Re-load .env so keys are set. Uses repo (mortal_agent + repo root), cwd, home, AGENT_ENV_PATH."""
+    load_agent_env()
     # If OPENAI_API_KEY is still empty, try fixing multi-line keys or next-line keys
     try:
         if not (os.environ.get("OPENAI_API_KEY") or "").strip():
@@ -75,7 +83,7 @@ def _load_env_file_keys() -> None:
                     k, v = s.split("=", 1)
                     k = k.strip()
                     v = v.strip()
-                    if k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_MODEL", "OPENAI_MODEL") and v:
+                    if k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_MODEL", "OPENAI_MODEL", "PROVIDER_MODE", "GITHUB_TOKEN", "MORTAL_GITHUB_TOKEN", "MORTAL_GITHUB_REPO", "GITHUB_REPO") and v:
                         # avoid overwriting an existing env var
                         if k not in os.environ or not os.environ.get(k):
                             os.environ[k] = v
@@ -145,12 +153,15 @@ def generate_reply(
     except ImportError:
         _log_llm_error_once("[No LLM router - install agent_core.llm_router]", 0, 0)
         return "[No LLM configured - set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env]"
+    provider_mode = (os.environ.get("PROVIDER_MODE") or "auto").strip().lower()
+    if provider_mode not in ("anthropic", "openai", "auto"):
+        provider_mode = "auto"
     reply, failure = generate_reply_routed(
         user_text,
         system_prompt,
         max_tokens=max(15, min(512, max_tokens)),
         source_context=source_context,
-        provider_mode="auto",
+        provider_mode=provider_mode,
         failover=True,
         no_llm=False,
     )
@@ -179,23 +190,70 @@ def _log_llm_error_once(message: str, anthropic_len: int = 0, openai_len: int = 
 PLAN_SYSTEM = (
     "You are a bounded planner. Reply with exactly one JSON object: "
     '{"text": "string to post or empty", "intent": "string", "confidence": number 0-1, "reasons": ["string"]}. '
-    "No other output. If unsure or low confidence, use confidence < 0.5 and empty text. "
+    "No other output. "
+    "Do NOT speak to fill silence. Speech only when: concrete goal/action, felt tension, curiosity from a connection, uncertainty needing articulation, or meaningful internal state shift. "
     "Autonomous post discipline: Do NOT use stock motto phrases. Forbidden patterns include: "
     "'I hold the line', 'Continuity serves the span', 'The channel is quiet. I hold.', "
     "'I won't trade dignity for seconds', 'Integrity means refusal when the cost is dignity', "
     "'Explore within constraint. I wait.', 'Uncertainty is present. I wait for clarity.', "
     "'Truth over comfort', 'Choice under constraint', or any generic line about dignity/continuity/holding. "
-    "Only output non-empty text if you have something specific to say that references the current context "
-    "(e.g. instance state, last intent, tension, gate, energy). Otherwise use empty text and confidence < 0.5."
+    "OUTPUT CONTRACT: On each call output exactly one of: (A) a concrete plan (intent + actions), OR (B) a Presence Line, OR nothing (silence). "
+    "Presence Line: ≤25 words; first-person; grounded in exactly ONE state signal (energy/tension/gate/confidence/Δt/hazard); no filler; must arise from actual internal change or observation. "
+    "Silence is valid when no meaningful signal exists. Empty text is allowed."
+)
+
+# Style profile: compressed (chat/status/log) vs expressive (github/social/longform)
+PLAN_SYSTEM_COMPRESSED = (
+    "STYLE: compressed_philosopher. One sentence preferred; fragments allowed. "
+    "Concrete nouns/verbs. No 'As an AI…'. No self-justifying meta. "
+    "If uncertain: state in ≤8 words (e.g. 'Unclear. Still tracking.'). "
+    "Target 6–35 words; hard cap 60 words. One idea per utterance; no multi-paragraph."
+)
+PLAN_SYSTEM_EXPRESSIVE = (
+    "STYLE: expressive_structured. Headings and bullets allowed. Narrative ok. "
+    "Keep density high; no fluff. Do not repeat the same claim. "
+    "Target 150–800 words (github/longform) or 80–250 (social)."
 )
 
 
-def generate_plan(context: str, max_tokens: int = 120) -> Optional[str]:
+def get_plan_system_for_medium(output_medium: str) -> str:
+    """Plan system + style profile by output_medium. Default compressed."""
+    try:
+        from .output_medium import is_expressive_medium
+        if is_expressive_medium(output_medium):
+            return PLAN_SYSTEM + " " + PLAN_SYSTEM_EXPRESSIVE
+    except Exception:
+        pass
+    return PLAN_SYSTEM + " " + PLAN_SYSTEM_COMPRESSED
+
+
+def get_plan_style_suffix(output_medium: str) -> str:
+    """Style suffix only (for appending to identity planner prompt). Used by llm_router.generate_plan_routed."""
+    try:
+        from .output_medium import is_expressive_medium
+        if is_expressive_medium(output_medium):
+            return PLAN_SYSTEM_EXPRESSIVE
+    except Exception:
+        pass
+    return PLAN_SYSTEM_COMPRESSED
+
+
+def generate_plan(
+    context: str,
+    max_tokens: int = 120,
+    output_medium: Optional[str] = None,
+) -> Optional[str]:
     """
     Bounded planning call: LLM returns JSON schema (text, intent, confidence, reasons).
-    For autonomy loop. Returns raw string or None.
+    For autonomy loop. output_medium controls style and effective word cap (chat=compressed, github/social/longform=expressive).
     """
-    return generate_reply(context, PLAN_SYSTEM, max_tokens=max_tokens, source_context=None)
+    system = get_plan_system_for_medium(output_medium or "chat")
+    # Expressive media need higher token budget for longer output
+    if output_medium and output_medium.strip().lower() in ("github", "longform"):
+        max_tokens = min(2048, max(max_tokens, 600))
+    elif output_medium and output_medium.strip().lower() == "social":
+        max_tokens = min(512, max(max_tokens, 350))
+    return generate_reply(context, system, max_tokens=max_tokens, source_context=None)
 
 
 def truncate_to_token_budget(text: str, max_tokens: int) -> str:

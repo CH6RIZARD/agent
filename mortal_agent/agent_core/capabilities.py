@@ -31,6 +31,21 @@ ACTION_WIKIPEDIA_LOOKUP = "wikipedia_lookup"
 ACTION_SEND_EMAIL = "send_email"
 ACTION_POST_SOCIAL_MEDIA = "post_social_media"
 
+# One-line human-readable description per capability (runtime data only; LLM answers in its own words).
+# Used so the agent can know what each capability does without hardcoding reply phrases.
+CAPABILITY_DESCRIPTIONS: Dict[str, str] = {
+    CAP_EMAIL_CLIENT: "Send email when SMTP or email API is configured.",
+    CAP_CONTENT_PUBLISHING: "Publish to Medium, Substack, or blog API when configured.",
+    CAP_SOCIAL_MEDIA: "Post to Twitter, Reddit, or other social APIs when configured.",
+    CAP_FILE_HOSTING: "Share artifacts via GitHub (issues/comments), Pastebin, or file host when token/keys are set.",
+    CAP_FORM_SUBMISSION: "Submit to forms or signup endpoints when API is configured.",
+    CAP_API_DISCOVERY: "Discover and call external APIs when discovery service is configured.",
+    CAP_CLOUD_SERVICE: "Use cloud compute (e.g. AWS, Replicate) when credentials are set.",
+    CAP_SEARCH_ENGINE: "Web search and information retrieval (e.g. DuckDuckGo, Serper, Bing).",
+    CAP_CODE_REPOSITORY: "Work with GitHub/GitLab: create issues, post comments, when token is set.",
+    CAP_PAYMENT_PROCESSING: "Process payments via Stripe, PayPal, etc. when configured.",
+}
+
 # Pre-approved low-risk actions (execute without asking permission)
 LOW_RISK_ACTIONS = [
     ACTION_WEB_SEARCH,
@@ -84,10 +99,18 @@ def check_capability(name: str) -> CapabilityStatus:
             risk_level="medium", intent_domain="participation_feedback",
         )
     if name == CAP_FILE_HOSTING:
-        has = _env_has("GITHUB_TOKEN", "PASTEBIN_API_KEY", "FILE_HOST_API_KEY")
+        try:
+            try:
+                from patches.github_integration import has_github_token
+            except ImportError:
+                from ..patches.github_integration import has_github_token
+            has_gh = has_github_token()
+        except Exception:
+            has_gh = _env_has("GITHUB_TOKEN")
+        has = has_gh or _env_has("PASTEBIN_API_KEY", "FILE_HOST_API_KEY")
         return CapabilityStatus(
             name=name, available=has,
-            missing=[] if has else ["GITHUB_TOKEN or PASTEBIN_API_KEY or FILE_HOST_API_KEY"],
+            missing=[] if has else ["GITHUB_TOKEN (or git credential) or PASTEBIN_API_KEY or FILE_HOST_API_KEY"],
             risk_level="low", intent_domain="share_artifacts",
         )
     if name == CAP_FORM_SUBMISSION:
@@ -119,10 +142,18 @@ def check_capability(name: str) -> CapabilityStatus:
             name=name, available=True, missing=[], risk_level="low", intent_domain="info_retrieval",
         )
     if name == CAP_CODE_REPOSITORY:
-        has = _env_has("GITHUB_TOKEN", "GITLAB_TOKEN")
+        try:
+            try:
+                from patches.github_integration import has_github_token
+            except ImportError:
+                from ..patches.github_integration import has_github_token
+            has_gh = has_github_token()
+        except Exception:
+            has_gh = _env_has("GITHUB_TOKEN")
+        has = has_gh or _env_has("GITLAB_TOKEN")
         return CapabilityStatus(
             name=name, available=has,
-            missing=[] if has else ["GITHUB_TOKEN or GITLAB_TOKEN"],
+            missing=[] if has else ["GITHUB_TOKEN (or git credential) or GITLAB_TOKEN"],
             risk_level="medium", intent_domain="clone_analyze_contribute",
         )
     if name == CAP_PAYMENT_PROCESSING:
@@ -133,6 +164,11 @@ def check_capability(name: str) -> CapabilityStatus:
             risk_level="high", intent_domain="transactions",
         )
     return CapabilityStatus(name=name, available=False, missing=["unknown_capability"], risk_level="high", intent_domain="unknown")
+
+
+def get_capability_description(name: str) -> str:
+    """Human-readable one-liner for this capability (runtime data only)."""
+    return CAPABILITY_DESCRIPTIONS.get(name, "").strip()
 
 
 def get_available_capabilities() -> List[CapabilityStatus]:

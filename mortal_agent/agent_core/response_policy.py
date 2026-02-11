@@ -256,9 +256,20 @@ def enforce_policy(
     return out
 
 
-def compress_to_depth(output: str, depth: Dict[str, Any]) -> str:
+def compress_to_max_words(output: str, max_words: int) -> str:
+    """Trim output to at most max_words. Used by Speech Suppression Gate (chat/status/log)."""
+    if not output or not output.strip() or max_words <= 0:
+        return output
+    words = output.strip().split()
+    if len(words) <= max_words:
+        return output.strip()
+    return " ".join(words[:max_words]).rstrip()
+
+
+def compress_to_depth(output: str, depth: Dict[str, Any], max_words: Optional[int] = None) -> str:
     """
     Trim output to max_lines. Remove markdown headings/--- by default. Bullets only if allow_bullets.
+    If max_words is set (from Speech Gate), enforce word cap after line trim.
     """
     if not output or not output.strip():
         return output
@@ -277,5 +288,9 @@ def compress_to_depth(output: str, depth: Dict[str, Any]) -> str:
         out = re.sub(r"\n\s*\d+[.)]\s+", " ", out)
     lines = [l.strip() for l in out.split("\n") if l.strip()]
     if len(lines) <= max_lines:
-        return "\n".join(lines).strip()
-    return "\n".join(lines[:max_lines]).strip()
+        out = "\n".join(lines).strip()
+    else:
+        out = "\n".join(lines[:max_lines]).strip()
+    if max_words is not None and max_words > 0:
+        out = compress_to_max_words(out, max_words)
+    return out

@@ -37,6 +37,8 @@ class GatedExecutor:
             # Try pipeline first (NET_FETCH, WEB_SEARCH, GITHUB_POST, etc.)
             if pipeline:
                 r = pipeline(item, instance_id)
+                if item.get("action") == "GITHUB_POST" and r:
+                    result["last_github_result"] = r.get("github_result_summary") or r
                 if r.get("executed"):
                     result["published"] = result.get("published", 0) + 1
                     continue

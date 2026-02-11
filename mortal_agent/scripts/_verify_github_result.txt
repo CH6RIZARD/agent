@@ -1,0 +1,5 @@
+start root=D:\agent\mortal_agent
+Token OK
+Repo: CH6RIZARD/agent
+API executed=True status=201
+OK: Issue #2 created: https://github.com/CH6RIZARD/agent/issues/2

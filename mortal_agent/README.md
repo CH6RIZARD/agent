@@ -70,3 +70,9 @@ Total source text is capped so it fits in the LLM system context.
 3. Each start = new instance_id
 4. internal_state = RAM only
 5. Δt only increases while BODY gate open
+
+## Quick tests (wander heartbeat)
+
+- **LLM ON:** Run `python -m cli.main run` for 2–3 minutes; expect at least 2–4 wander heartbeat posts (every ~25–30s, subject to post cooldown).
+- **LLM OFF:** Run `python -m cli.main run --no-llm` for 2–3 minutes; expect varied wander lines (ideology/source/state), no single repeated sentence.
+- Wander respects existing post cooldown and skips if a post was just made (no spam).

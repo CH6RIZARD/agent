@@ -77,14 +77,30 @@ try:
 except ImportError:
     OpenAI = None
 
-# LLM-only: one minimal fallback when model is unreachable (no rotating phrases).
+# LLM-only: pool of short first-person offline wander lines (no single repeated constant).
+_OFFLINE_WANDER_POOL = [
+    "I'm here; reasoning is offline.",
+    "Low energy. I'm still here.",
+    "I feel steady but offline.",
+    "Uncertain. I remain present.",
+    "I'm cautious; no reasoning right now.",
+    "Tension present. I'm still here.",
+    "I'm strained but here.",
+    "Gate closed. I'm cautious.",
+    "My reasoning is offline; I feel tense.",
+    "I remain; low energy.",
+    "I'm here; uncertain.",
+    "Offline. I feel steady.",
+    "I'm present; reasoning unavailable.",
+]
 _UNREACHABLE_FALLBACK = "I can't reach my reasoning right now."
 
 _llm_failure_logged: bool = False
+_last_offline_wander_index: int = -1
 
 
-def _log_llm_failure_once(failure_info: Optional[Dict[str, Any]]) -> None:
-    """Log once per process. Uses first failure so user sees why primary (Claude) failed."""
+def _log_llm_failure_once(failure_info: Optional[Dict[str, Any]], tried_failover: bool = False) -> None:
+    """Log once per process. Uses first failure so user sees why primary failed."""
     global _llm_failure_logged
     if _llm_failure_logged or not failure_info:
         return
@@ -92,10 +108,16 @@ def _log_llm_failure_once(failure_info: Optional[Dict[str, Any]]) -> None:
     code = failure_info.get("code", "unknown")
     detail = (failure_info.get("detail") or "")[:120]
     provider = failure_info.get("provider", "unknown")
-    hint = "Add credits at console.anthropic.com." if code == "quota" and provider == "anthropic" else "Check key and billing at console.anthropic.com; or use OPENROUTER/GROQ in .env for fallback."
+    if code == "quota" and provider == "anthropic":
+        hint = "Add credits at console.anthropic.com."
+    elif tried_failover:
+        hint = "Fallback providers were tried and failed. Check OPENROUTER_API_KEY, GROQ_API_KEY, and ANTHROPIC_API_KEY in .env."
+    else:
+        hint = "Set OPENROUTER_API_KEY or GROQ_API_KEY in .env for fallback when primary hits quota/429."
+    primary_desc = {"openai": "OpenAI", "anthropic": "Claude (ANTHROPIC_API_KEY)", "openrouter": "OpenRouter", "groq": "Groq"}.get(provider, provider)
     msg = (
         f"[agent] LLM unreachable ({provider}: {code}). {detail}\n"
-        f"Primary is Claude (ANTHROPIC_API_KEY). {hint}"
+        f"Primary was {primary_desc}. {hint}"
     )
     try:
         print(msg, file=sys.stderr, flush=True)
@@ -103,9 +125,21 @@ def _log_llm_failure_once(failure_info: Optional[Dict[str, Any]]) -> None:
         pass
 
 
-def get_offline_wander_text(energy: float = 100.0, hazard_score: float = 0.0) -> str:
-    """Fallback when LLM unavailable. LLM-only: single minimal line."""
-    return _UNREACHABLE_FALLBACK
+def get_offline_wander_text(
+    energy: float = 100.0,
+    hazard_score: float = 0.0,
+    last_text: Optional[str] = None,
+) -> str:
+    """Fallback when LLM unavailable. Returns one of a pool of short first-person lines; anti-repeat vs last_text."""
+    global _last_offline_wander_index
+    pool = _OFFLINE_WANDER_POOL
+    last = (last_text or "").strip()
+    candidates = [p for p in pool if (p or "").strip() != last] if last else list(pool)
+    if not candidates:
+        candidates = list(pool)
+    idx = (_last_offline_wander_index + 1) % len(candidates)
+    _last_offline_wander_index = idx
+    return candidates[idx]
 
 
 def is_unreachable_fallback(text: str) -> bool:
@@ -297,17 +331,31 @@ def _try_openai(
 
     openai_model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
+    def _call_openai(**kwargs) -> Tuple[Optional[Any], Optional[Exception]]:
+        try:
+            r = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                timeout=timeout_s,
+                **kwargs,
+            )
+            return r, None
+        except Exception as e:
+            return None, e
+
     try:
         client = OpenAI(api_key=openai_key, timeout=timeout_s)
-        r = client.chat.completions.create(
-            model=openai_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            max_tokens=max_tokens,
-        )
-        if r.choices and r.choices[0].message and r.choices[0].message.content:
+        r, err = _call_openai(max_tokens=max_tokens)
+        if err is not None:
+            msg = str(err).lower()
+            if "max_tokens" in msg and ("not supported" in msg or "max_completion_tokens" in msg or "use '" in msg):
+                r, err = _call_openai(max_completion_tokens=max_tokens)
+            if err is not None:
+                raise err
+        if r and r.choices and r.choices[0].message and r.choices[0].message.content:
             return r.choices[0].message.content.strip(), None
         return None, {"provider": "openai", "code": "unknown", "detail": "empty response"}
     except Exception as e:
@@ -334,9 +382,9 @@ def generate_reply_routed(
     - failure_info is None on success, or {"provider", "code", "detail"} on failure
 
     provider_mode:
-    - "anthropic": only try Anthropic
-    - "openai": only try OpenAI
-    - "auto": Claude (Anthropic) first, then OpenRouter, then OpenAI
+    - "anthropic": only try Anthropic (no failover unless failover=True and other providers added)
+    - "openai": prefer OpenAI; on 429/quota/unreachable fall back to OpenRouter, Groq, Anthropic (if failover=True)
+    - "auto": Claude (Anthropic) first, then OpenRouter, Groq, then OpenAI
 
     no_llm: if True, return None immediately (offline mode)
     """
@@ -353,13 +401,27 @@ def generate_reply_routed(
 
     max_tokens = max(15, min(512, max_tokens))
 
-    # Build provider list: auto = Claude first, then OpenRouter, OpenAI
+    # Build provider list: auto = Claude first, then OpenRouter, Groq, OpenAI.
+    # openai mode: prefer OpenAI but on 429/quota/unreachable fall back to OpenRouter, Groq, Anthropic.
     if provider_mode == "anthropic":
         providers = [("anthropic", _try_anthropic)]
     elif provider_mode == "openai":
-        providers = [("openai", _try_openai)]
-    else:  # auto: primary Claude, fallback OpenRouter then OpenAI
-        providers = [("anthropic", _try_anthropic), ("openrouter", _try_openrouter), ("openai", _try_openai)]
+        if failover:
+            providers = [
+                ("openai", _try_openai),
+                ("openrouter", _try_openrouter),
+                ("groq", _try_groq),
+                ("anthropic", _try_anthropic),
+            ]
+        else:
+            providers = [("openai", _try_openai)]
+    else:  # auto: primary Claude, fallback OpenRouter, Groq, then OpenAI
+        providers = [
+            ("anthropic", _try_anthropic),
+            ("openrouter", _try_openrouter),
+            ("groq", _try_groq),
+            ("openai", _try_openai),
+        ]
 
     if not failover:
         providers = providers[:1]
@@ -408,7 +470,8 @@ def generate_reply_routed(
                 continue
             break
 
-    _log_llm_failure_once(first_failure or last_failure)
+    tried_failover = failover and len(providers) > 1
+    _log_llm_failure_once(first_failure or last_failure, tried_failover=tried_failover)
     return None, last_failure
 
 
@@ -421,17 +484,23 @@ def generate_plan_routed(
     failover: bool = True,
     no_llm: bool = False,
     include_autonomy_claims: bool = True,
+    output_medium: str = "chat",
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Bounded planning call. Claude (Anthropic) first, then Groq, then chat stack.
     Returns (raw_json_text, failure_info).
-    System prompt from identity constraints; no hardcoded responses.
+    System prompt from identity constraints; output_medium controls style (compressed vs expressive).
     """
     if no_llm:
         return None, {"provider": "none", "code": "offline", "detail": "no_llm mode"}
     try:
         from .identity import get_planner_system_prompt
         plan_system = get_planner_system_prompt(include_autonomy_claims=include_autonomy_claims)
+        try:
+            from .llm import get_plan_style_suffix
+            plan_system = plan_system + " " + get_plan_style_suffix(output_medium or "chat")
+        except Exception:
+            pass
     except Exception:
         return None, {"provider": "identity", "code": "plan_prompt_unavailable", "detail": "Planner requires identity; cannot plan without it."}
     max_tokens = max(15, min(512, max_tokens))

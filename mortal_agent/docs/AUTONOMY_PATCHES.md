@@ -17,9 +17,17 @@ Capability patches and cognitive/autonomous layers for self-directed, emergent b
 ## Deploy-Only & RAM-Only (No Memory Persisted After Death)
 
 - Set `MORTAL_DEPLOY=1` (or `true`/`yes`/`on`/`deploy`) in the environment **only in deploy**. When unset (default):
-  - **Patch actions are disabled** (WEB_SCRAPE, FILE_HOST, etc. are not available).
+  - **Patch actions are disabled** (WEB_SCRAPE, FILE_HOST, etc. are not available) **except** `SELECT_AUTONOMY_ACTIONS` and **`GITHUB_POST`** (see below).
   - **No disk persistence**: `_save_persistent_state` and `append_delta_log` are no-ops. All memory is RAM-only; nothing is persisted after death.
 - When `MORTAL_DEPLOY` is set, state/delta may be written to disk for logs/debug; **loading** prior state is still forbidden (`PERSISTENCE_LOAD_FORBIDDEN`), so the next process is always a new being.
+
+### GitHub posting (always allowed)
+
+- **`GITHUB_POST`** runs **even when `MORTAL_DEPLOY` is not set**. The agent can create issues (and comments) on the workspace repo whenever his **internal or external** context gives him a reason to—from his own perspective (reflection, observation, desire to share, etc.).
+- Token: same as git push (git credential), or `GITHUB_TOKEN` / `MORTAL_GITHUB_TOKEN` in env. Repo: workspace `git origin` or `MORTAL_GITHUB_REPO`. Every post is signed as from the Mortal Agent.
+- Capability reporting uses the same token resolution (`patches/github_integration.has_github_token()`), so the agent correctly reports that he can post when a token is available.
+- **Do not** gate `GITHUB_POST` on `MORTAL_DEPLOY`; keep it in the allow-list in `patches/__init__.py` run_capability.
+- **When pushing to this repo:** keep this behavior—`GITHUB_POST` must remain in the deploy exception list so the agent can post to issues from his own perspective whenever he has a reason.
 
 ---
 
@@ -81,6 +89,7 @@ Nothing persists after death; pressure applies only within the current session.
 | API Discovery & Integration | `API_DISCOVER` | Find and connect to new APIs autonomously (RapidAPI, etc.); stub—wire catalog; args: `query`, `source`. |
 | Cloud Service Management | `CLOUD_SPINUP` | Spin up compute when needed (AWS, Replicate); stub—wire credentials; args: `provider`, `action`. |
 | Code Repository Access | `CODE_REPO` | Clone, analyze, potentially contribute to open source; args: `url`, `op` (clone/analyze). |
+| **GitHub post** | **`GITHUB_POST`** | Create issues (and comments) on the workspace repo. Allowed without deploy; agent can post when he has a reason (internal or external). Args: `op` (create_issue / create_comment), `title`, `body`, optional `repo`, `issue_number` (for comments). |
 | Payment Processing | `PAYMENT` | Stripe/PayPal when building value; stub—wire keys; args: `provider`, `amount`, `currency`. |
 
 **ch6rizard** is the current folder in the repo for signed, immersively emergent artifacts (`mortal_agent/ch6rizard/`). Each file is prefixed with `# signed:<hash> instance:<instance_id>`.
@@ -120,6 +129,15 @@ Nothing persists after death; pressure applies only within the current session.
 - **Consequence awareness** – Understands actions have costs (API limits, reputation, resources); resource limits, risk thresholds, survival overrides in will_kernel and survival_reasoner.
 - **Goal drift** – Initial objectives evolve based on what the agent learns about the world and itself (meaning_goal, hypotheses, narrator/state updates).
 - **Death is permanent** – Nothing persists after termination; cannot be resurrected.
+
+---
+
+## Continuous Expression (Presence)
+
+- **Invariant**: Every main-loop cycle produces non-empty output. Silence is not the default state.
+- **Per cycle**: The system outputs exactly one of (A) a concrete plan or action (e.g. PUBLISH_POST, NET_FETCH, CONSERVE), or (B) a **presence line**.
+- **Presence line** (`agent_core/presence.py`): First-person, ≤20 words, grounded in exactly one internal state signal (energy, tension, hazard, confidence, time-passing). No generic filler; phrasing is value-driven from current state and varies by signal rotation. When the autonomy tick does not emit observable output in a cycle, the main loop emits one presence line (throttled by `PRESENCE_INTERVAL`).
+- **Rules**: Planning is optional; presence is mandatory when no plan/action output. When cognition is degraded, internal state or belief fragments may speak instead of plans. No hard-coded triggers—presence is derived from life_state, meaning_state, runtime_state, and delta_t.
 
 ---
 

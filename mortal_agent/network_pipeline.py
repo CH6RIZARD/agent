@@ -100,9 +100,12 @@ def unified_network_pipeline(item: Dict[str, Any], instance_id: str) -> Dict[str
         return simple_http_fetch_pipeline(item, instance_id)
     if action == "WEB_SEARCH":
         return web_search_pipeline(item, instance_id)
-    # Route patch actions to patches module
+    # Route patch actions to patches module (patches when cwd is mortal_agent, else mortal_agent.patches)
     try:
-        from mortal_agent.patches import PATCH_ACTIONS, run_capability
+        try:
+            from patches import PATCH_ACTIONS, run_capability
+        except ImportError:
+            from mortal_agent.patches import PATCH_ACTIONS, run_capability
         if action in PATCH_ACTIONS:
             return run_capability(item, instance_id)
     except ImportError:

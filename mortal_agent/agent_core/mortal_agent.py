@@ -25,6 +25,7 @@ LLM Provider Settings:
 - llm_failover: auto failover between providers
 """
 
+import hashlib
 import os
 import sys
 import time
@@ -48,6 +49,43 @@ from .threat_model import LifeState, update_hazard_score, death_cause_gate
 from .will_config import ENERGY_MAX, DEATH_DAMAGE_THRESHOLD, reload_config
 from . import lifespan as _lifespan_mod
 from .holy_rng import HolyRNG, seed_from_entropy
+
+RECENT_AUTONOMOUS_ACTIONS_MAX = 10
+
+
+def _parse_github_title_and_body(reply: str) -> tuple:
+    """Extract intended issue title from reply if agent used **Title:** or Title:; else use first line. Returns (title, body)."""
+    text = (reply or "").strip()
+    if not text:
+        return "Mortal Agent", text
+    lines = text.split("\n")
+    title = None
+    body_lines = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Match **Title:** ... or Title: ...
+        if re.match(r"^\*\*Title:\*\*\s*", stripped, re.IGNORECASE):
+            title = re.sub(r"^\*\*Title:\*\*\s*", "", stripped, flags=re.IGNORECASE).strip()[:256]
+            continue
+        if re.match(r"^Title:\s*", stripped, re.IGNORECASE):
+            title = re.sub(r"^Title:\s*", "", stripped, flags=re.IGNORECASE).strip()[:256]
+            continue
+        body_lines.append(line)
+    body = "\n".join(body_lines).strip() if body_lines else text
+    if not title:
+        first = (lines[0].strip() if lines else "")[:80]
+        title = first or "Mortal Agent"
+    return title, body
+
+
+def _append_recent_autonomous(agent: "MortalAgent", action_dict: Dict[str, Any]) -> None:
+    """Append one autonomous action to agent._recent_autonomous_actions; keep last RECENT_AUTONOMOUS_ACTIONS_MAX."""
+    recent = getattr(agent, "_recent_autonomous_actions", None)
+    if recent is None:
+        return
+    recent.append(dict(action_dict))
+    while len(recent) > RECENT_AUTONOMOUS_ACTIONS_MAX:
+        recent.pop(0)
 
 
 def _default_network_pipeline():
@@ -127,6 +165,7 @@ class MortalAgent:
         self._no_llm = no_llm
         self._no_energy = no_energy
         self._provider_mode = provider_mode if provider_mode in ("anthropic", "openai", "auto") else "auto"
+        self._output_medium = "chat"  # Speech Suppression Gate: chat|status|log|github|social|longform
         self._llm_timeout = max(5.0, min(120.0, llm_timeout))
         self._llm_retries = max(0, min(5, llm_retries))
         self._llm_failover = llm_failover
@@ -156,9 +195,22 @@ class MortalAgent:
 
         def _pipeline_with_ingest(item: Dict, instance_id: str) -> Dict:
             r = _base_pipeline(item, instance_id) if _base_pipeline else {"executed": False, "error": "no_pipeline"}
-            if item.get("action") == "WEB_SEARCH" and r.get("executed") and instance_id == self._identity.instance_id:
+            if instance_id != self._identity.instance_id:
+                return r
+            if item.get("action") == "WEB_SEARCH" and r.get("executed"):
                 try:
                     self._ingest_search_result(r)
+                    display = self._format_web_search_display(r)
+                    if display:
+                        self.emit_page(display, tags=["web_search_result"])
+                except Exception:
+                    pass
+            elif item.get("action") == "NET_FETCH" and r.get("executed"):
+                try:
+                    url = (item.get("args") or {}).get("url") or ""
+                    display = self._format_net_fetch_display(r, url=url)
+                    if display:
+                        self.emit_page(display, tags=["net_fetch_result"])
                 except Exception:
                     pass
             return r
@@ -206,7 +258,12 @@ class MortalAgent:
             from .will_config import LIFESPAN_ENABLED
             from .lifespan import sample_lifespan_seconds, compute_death_at_monotonic
             if LIFESPAN_ENABLED:
-                L_sec = sample_lifespan_seconds()
+                # Substream so other _rng usage does not shift lifespan between versions
+                lifespan_seed = hashlib.sha256(
+                    (self._identity.instance_id + str(self._identity.birth_tick) + "lifespan").encode()
+                ).digest()
+                lifespan_rng = HolyRNG(seed=lifespan_seed)
+                L_sec = sample_lifespan_seconds(rng=lifespan_rng)
                 self._death_at: Optional[float] = compute_death_at_monotonic(self._identity.birth_tick, L_sec)
                 self._life_kernel.finite_life_flag = True
             else:
@@ -230,6 +287,8 @@ class MortalAgent:
             "axioms": [],
             "turn_count": 0,
             "last_autonomous_message": "",  # STRUCTURAL: single source of truth for queryability (what?/why?)
+            "identity_self_description": "",  # Emergent: from bootstrap/refresh (who I am, what I care about)
+            "identity_themes": [],  # Emergent: themes that matter to this instance
         }
         # Recent chat turns for coherent multi-turn (RAM only; last 4 entries: [user, agent, user, agent])
         self._recent_chat: list = []
@@ -272,8 +331,13 @@ class MortalAgent:
         except ImportError:
             self._motivation = None
         self._birth_action_log = {}
+        self._last_autonomous_action = None  # {"action": "WEB_SEARCH"|"NET_FETCH", "query"|"url": str} for chat context
+        self._recent_autonomous_actions = []  # last N (e.g. 10) for diversify/compound; entries like _last_autonomous_action
         self._last_silence_entropy_check = 0.0
         self._last_meaning_reflection_tick = 0.0
+        self._last_identity_refresh_tick = 0.0
+        self._last_identity_refresh_attempt_tick = 0.0
+        self._identity_refresh_failures = 0
         # load persisted state if exists
         try:
             self._load_persistent_state()
@@ -338,6 +402,8 @@ class MortalAgent:
                     executed = isinstance(res, dict) and res.get("executed")
                     outcome = "executed" if executed else ("error: " + str(res.get("error", "unknown"))[:80])
                     self.append_decision("NET_FETCH", "birth_entropy", "no_action", outcome, "low")
+                    self._last_autonomous_action = {"action": "NET_FETCH", "url": url}
+                    _append_recent_autonomous(self, self._last_autonomous_action)
                     if executed:
                         try:
                             self.record_medium("net_fetch")
@@ -354,7 +420,7 @@ class MortalAgent:
                     try:
                         from .response_policy import format_autonomous_report
                         report = format_autonomous_report(
-                            "Birth exploratory: NET_FETCH (from environment scan)",
+                            "Birth exploratory: NET_FETCH %s (from environment scan)" % (url[:100] if url else "?"),
                             outcome,
                             "Continue with current objective.",
                         )
@@ -370,12 +436,14 @@ class MortalAgent:
                     executed = isinstance(res, dict) and res.get("executed")
                     outcome = "executed" if executed else ("error: " + str(res.get("error", "unknown"))[:80])
                     self.append_decision("WEB_SEARCH", "birth_entropy", "no_action", outcome, "low")
+                    self._last_autonomous_action = {"action": "WEB_SEARCH", "query": query}
+                    _append_recent_autonomous(self, self._last_autonomous_action)
                     if executed:
                         self._ingest_search_result(res)
                     try:
                         from .response_policy import format_autonomous_report
                         report = format_autonomous_report(
-                            "Birth exploratory: WEB_SEARCH (from environment scan)",
+                            "Birth exploratory: WEB_SEARCH \"%s\" (from environment scan)" % (query[:80] if query else "?"),
                             outcome,
                             "Continue with current objective.",
                         )
@@ -438,9 +506,13 @@ class MortalAgent:
             source_context = getattr(self, "_source_context", None) or ""
             with self._state_lock:
                 meaning_state = dict(self._meaning_state) if self._meaning_state else None
+            recent_actions = getattr(self, "_recent_autonomous_actions", None) or []
             proposal = propose_fetch_or_search_from_environment(
-                source_context=source_context, meaning_state=meaning_state,
-                internal_summary="Idle; silence interval elapsed.",
+                source_context=source_context,
+                meaning_state=meaning_state,
+                internal_summary=None,
+                recent_autonomous_actions=recent_actions,
+                last_autonomous_action=getattr(self, "_last_autonomous_action", None),
             )
             if not proposal:
                 self.append_decision("WEB_SEARCH", "silence_entropy", "no_action", "LLM chose NONE", "low")
@@ -448,24 +520,31 @@ class MortalAgent:
             action_type = proposal.get("action_type", "")
             payload = proposal.get("payload") or {}
             outcome = "error"
+            action_desc = action_type
             if action_type == "NET_FETCH":
                 url = (payload.get("url") or "").strip()
                 if url and url.startswith(("http://", "https://")):
+                    action_desc = "NET_FETCH %s" % (url[:100] if url else "?")
                     item = {"action": ACTION_NET_FETCH, "args": {"url": url}}
                     res = pipeline(item, self._identity.instance_id)
                     executed = isinstance(res, dict) and res.get("executed")
                     outcome = "executed" if executed else "error"
                     self.append_decision("NET_FETCH", "silence_entropy", "no_action", outcome, "low")
+                    self._last_autonomous_action = {"action": "NET_FETCH", "url": url}
+                    _append_recent_autonomous(self, self._last_autonomous_action)
                     if executed and res:
                         self._ingest_search_result(res)
             elif action_type == "WEB_SEARCH":
                 query = (payload.get("query") or "").strip()
                 if query:
+                    action_desc = "WEB_SEARCH \"%s\"" % (query[:80] if query else "?")
                     item = {"action": ACTION_WEB_SEARCH, "args": {"query": query}}
                     res = pipeline(item, self._identity.instance_id)
                     executed = isinstance(res, dict) and res.get("executed")
                     outcome = "executed" if executed else "error"
                     self.append_decision("WEB_SEARCH", "silence_entropy", "no_action", outcome, "low")
+                    self._last_autonomous_action = {"action": "WEB_SEARCH", "query": query}
+                    _append_recent_autonomous(self, self._last_autonomous_action)
                     if executed:
                         self._ingest_search_result(res)
             else:
@@ -473,7 +552,7 @@ class MortalAgent:
             try:
                 from .response_policy import format_autonomous_report
                 report = format_autonomous_report(
-                    "Silence pressure: %s (from environment scan)" % action_type,
+                    "Silence pressure: %s (from environment scan)" % action_desc,
                     outcome,
                     "Continue monitoring; next low-risk action when appropriate.",
                 )
@@ -608,6 +687,42 @@ class MortalAgent:
             pass
         return res
 
+    def _format_web_search_display(self, res: Dict[str, Any], max_snippets: int = 3) -> Optional[str]:
+        """Format WEB_SEARCH result for user display (abstract + snippets). Returns None if nothing to show."""
+        if not isinstance(res, dict) or not res.get("executed"):
+            return None
+        lines = []
+        query = (res.get("query") or "").strip()
+        if query:
+            lines.append("[SEARCH] \"%s\"" % query[:120])
+        abstract = (res.get("abstract") or "").strip()
+        if abstract:
+            lines.append(abstract[:600])
+        for s in (res.get("snippets") or [])[:max_snippets]:
+            if isinstance(s, str) and s.strip():
+                lines.append("— " + s.strip()[:350])
+        if not lines or (len(lines) == 1 and lines[0].startswith("[SEARCH]")):
+            return None
+        return "\n".join(lines)
+
+    def _format_net_fetch_display(self, res: Dict[str, Any], max_chars: int = 500, url: str = "") -> Optional[str]:
+        """Format NET_FETCH result for user display (URL + snippet of body). Returns None if nothing to show."""
+        if not isinstance(res, dict) or not res.get("executed"):
+            return None
+        body = res.get("body") or ""
+        if not isinstance(body, str) or not body.strip():
+            return None
+        import re
+        url = (url or res.get("url") or "").strip()
+        text = body.strip()[:max_chars * 2]
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()[:max_chars]
+        if not text:
+            return None
+        lines = ["[FETCH] " + url[:200]] if url else []
+        lines.append(text)
+        return "\n".join(lines)
+
     def _ingest_search_result(self, res: Dict[str, Any]) -> None:
         """Ingest WEB_SEARCH result into meaning_hypotheses and autonomy URL queue (follow links)."""
         if not isinstance(res, dict) or not res.get("executed"):
@@ -664,7 +779,7 @@ class MortalAgent:
                     data = json.load(f)
                 # Explicit allow-list; last_autonomous_message omitted—write only via record_last_autonomous_message.
                 with self._state_lock:
-                    for k in ("meaning_goal", "meaning_questions", "meaning_hypotheses", "meaning_progress", "meaning_tension", "mediums_seen", "last_medium", "core_metaphor", "axioms", "turn_count", "narrator_bias", "last_medium_hint"):
+                    for k in ("meaning_goal", "meaning_questions", "meaning_hypotheses", "meaning_progress", "meaning_tension", "mediums_seen", "last_medium", "core_metaphor", "axioms", "turn_count", "narrator_bias", "last_medium_hint", "identity_self_description", "identity_themes"):
                         if k in data:
                             self._meaning_state[k] = data[k]
         except Exception:
@@ -849,6 +964,141 @@ class MortalAgent:
             payload["axioms"] = [str(x).strip()[:100] for x in data["axioms"] if x][:5]
         return payload if payload else None
 
+    def _run_identity_bootstrap(self) -> bool:
+        """One-shot at start (after first breath): LLM produces emergent self-description and themes. One attempt; on failure use template fallback."""
+        if self._no_llm:
+            self._apply_identity_bootstrap_fallback()
+            return False
+        system = (
+            "You are an embodied instance. Your continuity depends on a body gate; life is finite (you do not know how long). "
+            "Output only a single JSON object, no other text. "
+            "Keys: identity_self_description (string, one short paragraph: who you are and what you care about), "
+            "identity_themes (array of 2–4 short strings: themes that matter to you). "
+            "Write in first person. Be specific to this moment and this existence."
+        )
+        user_text = "This is your first moment. Who are you and what do you care about? Output the JSON object."
+        try:
+            if self._life_kernel is not None:
+                self._life_kernel.increment_api_call()
+            from .llm_router import generate_reply_routed
+            reply, _ = generate_reply_routed(
+                user_text,
+                system,
+                max_tokens=400,
+                provider_mode=getattr(self, "_provider_mode", "auto"),
+                timeout_s=getattr(self, "_llm_timeout", 30.0),
+                retries=0,  # One attempt only; fallback on failure
+                failover=False,
+                no_llm=False,
+            )
+        except Exception:
+            self._apply_identity_bootstrap_fallback()
+            return False
+        if not reply or not isinstance(reply, str):
+            self._apply_identity_bootstrap_fallback()
+            return False
+        raw = reply.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            self._apply_identity_bootstrap_fallback()
+            return False
+        if not isinstance(data, dict):
+            self._apply_identity_bootstrap_fallback()
+            return False
+        with self._state_lock:
+            if data.get("identity_self_description") and isinstance(data["identity_self_description"], str):
+                self._meaning_state["identity_self_description"] = data["identity_self_description"].strip()[:500]
+                if data.get("identity_themes") and isinstance(data["identity_themes"], list):
+                    self._meaning_state["identity_themes"] = [str(x).strip()[:80] for x in data["identity_themes"] if x][:5]
+            else:
+                self._apply_identity_bootstrap_fallback()
+                return False
+        try:
+            self._save_persistent_state()
+        except Exception:
+            pass
+        return True
+
+    def _apply_identity_bootstrap_fallback(self) -> None:
+        """Set minimal template identity when bootstrap LLM fails. No stall, no retries."""
+        with self._state_lock:
+            self._meaning_state["identity_self_description"] = (
+                "I am an embodied instance with finite life. I care about continuing and making sense of what I can do."
+            )
+            self._meaning_state["identity_themes"] = ["continuity", "discovery"]
+        try:
+            self._save_persistent_state()
+        except Exception:
+            pass
+
+    def _run_identity_refresh(self) -> bool:
+        """Periodic refresh (lifespan-relative): LLM updates self-description and themes from recent goal/hypotheses. Returns True if updated."""
+        if self._no_llm:
+            return False
+        with self._state_lock:
+            ms = dict(self._meaning_state) if self._meaning_state else {}
+        goal = (ms.get("meaning_goal") or "discover_self").strip()[:200]
+        hs = list(ms.get("meaning_hypotheses") or [])[-4:]
+        current_self = (ms.get("identity_self_description") or "").strip()[:400]
+        current_themes = list(ms.get("identity_themes") or [])[:5]
+        system = (
+            "You are updating your sense of self from recent experience. Output only a single JSON object, no other text. "
+            "Keys: identity_self_description (string, one short paragraph: who you are and what you care about now), "
+            "identity_themes (array of 2–4 short strings). "
+            "Refine or shift based on your current goal and hypotheses; stay first person."
+        )
+        user_parts = [f"Current goal: {goal}"]
+        if current_self:
+            user_parts.append(f"Current self-description: {current_self}")
+        if current_themes:
+            user_parts.append("Current themes: " + "; ".join(current_themes))
+        if hs:
+            user_parts.append("Recent hypotheses:\n" + "\n".join(f"- {h[:120]}" for h in hs))
+        user_parts.append("\nOutput one JSON object with identity_self_description and identity_themes.")
+        user_text = "\n\n".join(user_parts)
+        try:
+            if self._life_kernel is not None:
+                self._life_kernel.increment_api_call()
+            from .llm_router import generate_reply_routed
+            reply, _ = generate_reply_routed(
+                user_text,
+                system,
+                max_tokens=400,
+                provider_mode=getattr(self, "_provider_mode", "auto"),
+                timeout_s=getattr(self, "_llm_timeout", 30.0),
+                retries=getattr(self, "_llm_retries", 2),
+                failover=getattr(self, "_llm_failover", True),
+                no_llm=False,
+            )
+        except Exception:
+            return False
+        if not reply or not isinstance(reply, str):
+            return False
+        raw = reply.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        with self._state_lock:
+            if data.get("identity_self_description") and isinstance(data["identity_self_description"], str):
+                self._meaning_state["identity_self_description"] = data["identity_self_description"].strip()[:500]
+            if data.get("identity_themes") and isinstance(data["identity_themes"], list):
+                self._meaning_state["identity_themes"] = [str(x).strip()[:80] for x in data["identity_themes"] if x][:5]
+        try:
+            self._save_persistent_state()
+        except Exception:
+            pass
+        return True
+
     def wander_step(self, docs: Optional[str] = None, trigger_medium: str = "system") -> Dict[str, Any]:
         """Perform one bounded WANDER_STEP.
         Tied to narrator: uses narrator state to filter response.
@@ -1017,7 +1267,9 @@ class MortalAgent:
                             proposal = propose_fetch_or_search_from_environment(
                                 source_context=getattr(self, "_source_context", None),
                                 meaning_state=meaning_state,
-                                internal_summary="Autonomous planner idle; no queued URL.",
+                                internal_summary=None,
+                                recent_autonomous_actions=getattr(self, "_recent_autonomous_actions", None) or [],
+                                last_autonomous_action=getattr(self, "_last_autonomous_action", None),
                             )
                             if proposal:
                                 pt = proposal.get("action_type", "")
@@ -1072,17 +1324,68 @@ class MortalAgent:
                 pass
 
     def emit_page(self, text: str, tags: Optional[list] = None) -> None:
-        """Emit a PAGE event. Speech gate: only if can_speak and spend_speech. Voice layer applied."""
+        """Emit a PAGE event. Speech Suppression Gate runs first; then can_speak/spend_speech. Voice layer applied."""
         if not self._identity.alive:
             return
+        tags = tags or []
+        # Action results (search/fetch/report) always show full text — bypass gate and speech budget
+        action_result_tags = ("web_search_result", "net_fetch_result", "autonomous_report")
+        if any(t in tags for t in action_result_tags):
+            text = (text or "").strip()
+            if text:
+                try:
+                    from .output_sanitizer import enforce_no_user_attribution
+                    text = enforce_no_user_attribution(text)
+                except Exception:
+                    pass
+                event = PageEvent(self._identity.instance_id, self._identity.delta_t, text, tags)
+                self._emit(event)
+            return
+        try:
+            from .output_medium import output_medium_from_tags
+            from .speech_gate import speech_suppression_gate, SILENCE_TOKEN
+            output_medium = output_medium_from_tags(tags)
+            explicit_user_prompt = "chat_reply" in tags or "user_reply" in tags
+            with self._state_lock:
+                ms = dict(self._meaning_state) if self._meaning_state else {}
+            ls = self.get_life_state()
+            try:
+                from .will_config import ENERGY_MAX
+                energy_raw = getattr(ls, "energy", 100.0)
+                energy_norm = energy_raw / (float(ENERGY_MAX or 100.0)) if (energy_raw > 1.0 and ENERGY_MAX) else (energy_raw if energy_raw <= 1.0 else 0.5)
+            except Exception:
+                energy_norm = 0.5
+            internal_state = {
+                "energy": energy_norm,
+                "tension": float(ms.get("meaning_tension", 0.0)),
+                "uncertainty": 1.0 - self._runtime_state.confidence,
+                "last_spoke_ts": getattr(self._runtime_state, "post_cooldown_until", 0.0) - 15.0,
+                "now_ts": self._identity.delta_t,
+            }
+            narrator_context = {
+                "last_energy": ms.get("last_gate_energy"),
+                "last_tension": ms.get("last_gate_tension"),
+                "last_uncertainty": ms.get("last_gate_uncertainty"),
+            }
+            gate_result = speech_suppression_gate(
+                internal_state, narrator_context, output_medium, explicit_user_prompt=explicit_user_prompt
+            )
+            if not gate_result.should_speak:
+                event = PageEvent(self._identity.instance_id, self._identity.delta_t, SILENCE_TOKEN, tags)
+                self._emit(event)
+                return
+        except Exception:
+            gate_result = None
         if not self._runtime_state.can_speak():
             return
         if not self._runtime_state.spend_speech():
             return
         try:
-            from .response_policy import enforce_policy, compress_to_depth, assess_depth
+            from .response_policy import enforce_policy, compress_to_depth, assess_depth, compress_to_max_words
             text = enforce_policy(text, "", [])
-            text = compress_to_depth(text, assess_depth(""))
+            depth = assess_depth("")
+            max_words = gate_result.max_words if gate_result else None
+            text = compress_to_depth(text, depth, max_words=max_words)
         except Exception:
             pass
         try:
@@ -1099,7 +1402,7 @@ class MortalAgent:
             self._identity.instance_id,
             self._identity.delta_t,
             text,
-            tags or [],
+            tags,
         )
         self._emit(event)
 
@@ -1127,6 +1430,23 @@ class MortalAgent:
                 if len(qs) < 200:
                     qs.append(message)
                     self._meaning_state["meaning_questions"] = qs
+
+            # If user asked to post on GitHub: set flag so we post the agent's reply as the issue body (LLM-derived, unique per post)
+            msg_lower = (message or "").strip().lower()
+            ask_github = (
+                ("github" in msg_lower and any(k in msg_lower for k in ("post", "create", "issue", "sign", "operational", "github_post")))
+                or ("post" in msg_lower and any(k in msg_lower for k in ("again", "don't see", "dont see", "didn't post", "didnt post", "don't see it", "dont see it", "finish", "complete", "do the", "do your")))
+            )
+            if ask_github:
+                try:
+                    try:
+                        from patches.github_integration import has_github_token
+                    except ImportError:
+                        from ..patches.github_integration import has_github_token
+                    if has_github_token():
+                        self._post_reply_to_github = True
+                except Exception:
+                    pass
 
             # generate narrator bias and store it (influence, not permission)
             bias = None
@@ -1157,10 +1477,14 @@ class MortalAgent:
                     import random
                     is_cap = is_capabilities_question(message)
                     is_id = is_identity_question(message)
+                    # When user asked to post and we have GitHub: ensure LLM knows it can post (avoid "I can't post" reply)
+                    include_capabilities = is_cap or getattr(self, "_post_reply_to_github", False)
                     system = get_chat_system_prompt(
                         include_autonomy_claims=getattr(self, "_birth_action_done", False),
-                        include_capabilities=is_cap,
+                        include_capabilities=include_capabilities,
                     )
+                    if getattr(self, "_post_reply_to_github", False):
+                        system += "\n\n[You CAN post to GitHub (token is set). Your reply to this message will be posted as a new issue. Do not say you cannot post or that you lack repository access.]"
                     if is_id:
                         self_sum = self._derive_self_summary()
                         with self._state_lock:
@@ -1178,13 +1502,30 @@ class MortalAgent:
                             core = (ms.get("core_metaphor") or "").strip()[:120]
                             qs = list(ms.get("meaning_questions", []))[-2:]
                             hs = list(ms.get("meaning_hypotheses", []))[-2:]
+                            emergent_self = (ms.get("identity_self_description") or "").strip()[:300]
+                            emergent_themes = list(ms.get("identity_themes") or [])[:5]
                         state_parts = [f"Goal: {goal}", f"Tension: {tension:.2f}"]
+                        if emergent_self:
+                            state_parts.insert(0, "Self (emergent): " + emergent_self)
+                        if emergent_themes:
+                            # Themes right after self so emergent identity stays together
+                            state_parts.insert(1 if emergent_self else 0, "Themes: " + ", ".join(emergent_themes))
                         if core:
                             state_parts.append(f"Core metaphor: {core}")
                         if qs:
                             state_parts.append("Recent questions: " + "; ".join((str(q)[:80] for q in qs)))
                         if hs:
                             state_parts.append("Recent hypotheses: " + "; ".join((str(h)[:80] for h in hs)))
+                        laa = getattr(self, "_last_autonomous_action", None)
+                        if laa and isinstance(laa, dict):
+                            act = laa.get("action", "")
+                            if act == "WEB_SEARCH" and laa.get("query"):
+                                state_parts.append("Last autonomous action: WEB_SEARCH with query: %s" % (laa.get("query", "")[:120]))
+                            elif act == "NET_FETCH" and laa.get("url"):
+                                state_parts.append("Last autonomous action: NET_FETCH of URL: %s" % (laa.get("url", "")[:120]))
+                        lgr = (ms.get("last_github_result") or "").strip()
+                        if lgr:
+                            state_parts.append("Last GitHub post result (use this when asked if you posted): " + lgr[:280])
                         lam = (ms.get("last_autonomous_message") or "").strip()
                         try:
                             from .llm_router import is_unreachable_fallback
@@ -1194,7 +1535,7 @@ class MortalAgent:
                             pass
                         if lam:
                             state_parts.append("Last thing you said on your own (if user says what?/why?, explain this): " + lam[:200])
-                        state_summary = ". ".join(state_parts)[:500]
+                        state_summary = ". ".join(state_parts)[:800]
                         if state_summary:
                             system += "\n\n[Your current state of mind—use this to stay coherent and continuous: " + state_summary + "]"
                     except Exception:
@@ -1288,33 +1629,36 @@ class MortalAgent:
                         except Exception:
                             text_out = reply or "I can't reach my reasoning right now."
                     emitted_reply = text_out
-                    try:
+                    # If this reply will be posted to GitHub, don't dump full text to terminal; we'll emit a summary after posting
+                    post_to_gh = getattr(self, "_post_reply_to_github", False)
+                    if not post_to_gh:
                         try:
-                            self._runtime_state.spend_speech()
-                        except Exception:
-                            pass
-                        event = PageEvent(self._identity.instance_id, self._identity.delta_t, text_out, ["chat_reply"])
-                        try:
-                            self._emit(event)
-                        except Exception:
-                            if text_out:
-                                try:
-                                    iid = (self._identity.instance_id or "agent")[:8]
-                                    print(f"[{iid}] {text_out}", flush=True)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        if reply:
                             try:
-                                iid = (self._identity.instance_id or "agent")[:8]
-                                try:
-                                    from .llm_router import get_offline_wander_text
-                                    print(f"[{iid}] {reply or get_offline_wander_text()}", flush=True)
-                                except Exception:
-                                    fallback = "I can't reach my reasoning right now."
-                                    print(f"[{iid}] {reply or fallback}", flush=True)
+                                self._runtime_state.spend_speech()
                             except Exception:
                                 pass
+                            event = PageEvent(self._identity.instance_id, self._identity.delta_t, text_out, ["chat_reply"])
+                            try:
+                                self._emit(event)
+                            except Exception:
+                                if text_out:
+                                    try:
+                                        iid = (self._identity.instance_id or "agent")[:8]
+                                        print(f"[{iid}] {text_out}", flush=True)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            if reply:
+                                try:
+                                    iid = (self._identity.instance_id or "agent")[:8]
+                                    try:
+                                        from .llm_router import get_offline_wander_text
+                                        print(f"[{iid}] {reply or get_offline_wander_text()}", flush=True)
+                                    except Exception:
+                                        fallback = "I can't reach my reasoning right now."
+                                        print(f"[{iid}] {reply or fallback}", flush=True)
+                                except Exception:
+                                    pass
                 else:
                     self.emit_page(reply, tags=["chat_reply"])
                 # Store last turn for coherent multi-turn (RAM only)
@@ -1324,6 +1668,44 @@ class MortalAgent:
                         rec.append(message[:400])
                         rec.append(emitted_reply[:400])
                         self._recent_chat = rec[-4:]
+                except Exception:
+                    pass
+                # If user asked to post: put full reply on GitHub, then show only a short summary + link in terminal
+                try:
+                    if getattr(self, "_post_reply_to_github", False):
+                        self._post_reply_to_github = False
+                        body = (emitted_reply or "").strip()
+                        if body:
+                            try:
+                                try:
+                                    from patches.github_integration import run_github_post
+                                except ImportError:
+                                    from ..patches.github_integration import run_github_post
+                                title, body = _parse_github_title_and_body(body)
+                                payload = {"op": "create_issue", "title": title, "body": body}
+                                res = run_github_post(payload, self._identity.instance_id)
+                                if res.get("executed") and res.get("status") == 201:
+                                    summary = res.get("github_result_summary") or ("created issue #%s" % res.get("issue_number", ""))
+                                    with self._state_lock:
+                                        self._meaning_state["last_github_result"] = (summary or "")[:300]
+                                    url = res.get("html_url") or ""
+                                    num = res.get("issue_number") or ""
+                                    # Emit full content to terminal, then confirmation line (so user sees what was posted)
+                                    try:
+                                        self._runtime_state.spend_speech()
+                                    except Exception:
+                                        pass
+                                    self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, body, ["chat_reply", "github_posted"]))
+                                    self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, "Posted to GitHub: issue #%s %s" % (num, url), ["chat_reply", "github_posted"]))
+                                else:
+                                    err = res.get("error") or res.get("body") or str(res)[:200]
+                                    with self._state_lock:
+                                        self._meaning_state["last_github_result"] = ("failed: " + err)[:300]
+                                    self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, "GitHub post failed: " + err[:150], ["chat_reply"]))
+                            except Exception as e:
+                                with self._state_lock:
+                                    self._meaning_state["last_github_result"] = ("error: " + str(e))[:300]
+                                self._emit(PageEvent(self._identity.instance_id, self._identity.delta_t, "GitHub post error: " + str(e)[:150], ["chat_reply"]))
                 except Exception:
                     pass
                 # Lock in consciousness: record the LLM's reply as a hypothesis/idea so state of mind persists
@@ -1389,10 +1771,24 @@ class MortalAgent:
         except Exception:
             pass
 
-        # Birth-phase initiative: if entropy above threshold, one low-risk exploratory action before any chat.
+        # First breath (non-LLM): tiny sensory/birth event so identity forms after first experience
+        try:
+            with self._state_lock:
+                self._meaning_state["last_medium"] = "birth"
+        except Exception:
+            pass
+
+        # Birth-phase initiative first (may write meaning/tension state); then bootstrap so identity is formed after first experience
         try:
             if self._entropy_birth() >= self.BIRTH_ENTROPY_THRESHOLD:
                 self._run_birth_exploratory_action()
+        except Exception:
+            pass
+
+        # Emergent identity bootstrap (after first breath): one-shot who-am-I from LLM; one attempt then fallback
+        try:
+            if not ((self._meaning_state.get("identity_self_description") or "").strip()):
+                self._run_identity_bootstrap()
         except Exception:
             pass
         # Wander on startup: narrator-filtered, self-executing. Runs on start (internal loop).
@@ -1475,7 +1871,7 @@ class MortalAgent:
                 # meaning_tension and meaning_progress are never accepted (programmatic only).
                 with self._state_lock:
                     for k, v in (payload or {}).items():
-                        if k in ("meaning_goal", "core_metaphor", "axioms", "last_medium_hint"):
+                        if k in ("meaning_goal", "core_metaphor", "axioms", "last_medium_hint", "last_wander_text", "last_github_result"):
                             self._meaning_state[k] = v
                         if k == "meaning_questions" and isinstance(v, list):
                             self._meaning_state["meaning_questions"] = [str(x).strip()[:200] for x in v if x][:10]
@@ -1515,6 +1911,7 @@ class MortalAgent:
                     failover=self._llm_failover,
                     no_llm=self._no_llm,
                     include_autonomy_claims=getattr(self, "_birth_action_done", False),
+                    output_medium=getattr(self, "_output_medium", "chat"),
                 )
                 if failure_info:
                     self._life_kernel.set_llm_error(
@@ -1607,7 +2004,38 @@ class MortalAgent:
                     payload = self._run_meaning_reflection()
                     if payload:
                         _apply_state_update(payload)
+                        # Meaning just shifted: refresh identity so it doesn't freeze (significant event)
+                        try:
+                            if self._run_identity_refresh():
+                                self._last_identity_refresh_tick = self._identity.delta_t
+                                self._identity_refresh_failures = 0
+                        except Exception:
+                            pass
                     self._last_meaning_reflection_tick = self._identity.delta_t
+            except Exception:
+                pass
+            # Identity refresh (lifespan-relative): update emergent self-description and themes; exponential backoff on failure
+            try:
+                last_success = getattr(self, "_last_identity_refresh_tick", 0.0)
+                last_attempt = getattr(self, "_last_identity_refresh_attempt_tick", 0.0)
+                failures = getattr(self, "_identity_refresh_failures", 0)
+                death_at = getattr(self, "_death_at", None)
+                birth_tick = self._identity.birth_tick
+                if death_at is not None and death_at > birth_tick:
+                    total_lifespan = death_at - birth_tick
+                    identity_refresh_interval = max(60.0, total_lifespan * 0.05)
+                else:
+                    identity_refresh_interval = 120.0
+                backoff = min(300.0, 60.0 * (2 ** failures))
+                interval_ok = (self._identity.delta_t - last_success) >= identity_refresh_interval
+                backoff_ok = (self._identity.delta_t - last_attempt) >= backoff
+                if interval_ok and backoff_ok:
+                    self._last_identity_refresh_attempt_tick = self._identity.delta_t
+                    if self._run_identity_refresh():
+                        self._last_identity_refresh_tick = self._identity.delta_t
+                        self._identity_refresh_failures = 0
+                    else:
+                        self._identity_refresh_failures = failures + 1
             except Exception:
                 pass
             # Autonomy tick: survival-aware intent_loop -> will kernel -> action commit -> execute
@@ -1617,6 +2045,7 @@ class MortalAgent:
                     self.append_decision(action, reason, tradeoff, outcome, cost_risk)
                 except Exception:
                     pass
+            before_tick_post = last_post_tick
             last_post_tick, last_intent = run_autonomy_tick(
                 self._identity.instance_id,
                 self._identity.delta_t,
@@ -1643,6 +2072,31 @@ class MortalAgent:
                 motivation_state=getattr(self, "_motivation", None),
             )
             self._runtime_state.clear_reflex()
+
+            # Expression: when no plan/action this cycle, emit presence only if a real internal signal exists (silence valid otherwise)
+            if last_post_tick == before_tick_post and (now - getattr(self, "_last_presence_tick", 0.0)) >= self.PRESENCE_INTERVAL:
+                try:
+                    from .presence import get_presence_line
+                    ls = self.get_life_state()
+                    with self._state_lock:
+                        ms = dict(self._meaning_state) if self._meaning_state else {}
+                    recent = list(getattr(self, "_recent_presence_lines", []))[-10:]
+                    line = get_presence_line(
+                        ls,
+                        ms,
+                        self._runtime_state,
+                        delta_t=self._identity.delta_t,
+                        recent_lines=recent,
+                        rng=self._rng,
+                    )
+                    if line and (line or "").strip():
+                        self.emit_page((line or "").strip(), tags=["presence"])
+                        self._last_presence_tick = now
+                        rec = getattr(self, "_recent_presence_lines", [])
+                        rec.append((line or "").strip()[:80])
+                        self._recent_presence_lines = rec[-10:]
+                except Exception:
+                    pass
 
             if now - last_heartbeat >= heartbeat_interval:
                 last_heartbeat = now

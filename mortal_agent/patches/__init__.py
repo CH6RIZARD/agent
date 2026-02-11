@@ -71,8 +71,9 @@ def run_capability(item: Dict[str, Any], instance_id: str) -> Dict[str, Any]:
     Live only on deploy: when MORTAL_DEPLOY is not set, returns deploy_only (no memory persisted after death).
     """
     action = (item.get("action") or "").strip()
-    # SELECT_AUTONOMY_ACTIONS allowed without deploy (no persistence/respawn/memory)
-    if not _is_deploy() and action not in (ACTION_SELECT_AUTONOMY_ACTIONS,):
+    # SELECT_AUTONOMY_ACTIONS and GITHUB_POST allowed without deploy (no persistence/respawn/memory).
+    # GITHUB_POST: agent can create issues whenever internal or external factors give him a reason (from his perspective).
+    if not _is_deploy() and action not in (ACTION_SELECT_AUTONOMY_ACTIONS, ACTION_GITHUB_POST):
         return {"executed": False, "error": "deploy_only"}
     args = item.get("args") or {}
     if action not in _ALL_PATCH_ACTIONS:

@@ -6,6 +6,7 @@ Generates internal proposals when idle, but now with survival awareness:
 - Proposes CONSERVE when energy is critically low
 - Adjusts risk/value based on current state
 - Always includes survival-appropriate options
+- Proposes GITHUB_POST when the agent has a reason (internal reflection or external e.g. LLM unreachable).
 
 The intent loop is the agent's "what should I do next?" system.
 """
@@ -48,6 +49,61 @@ def _estimate_time_pressure(life_state: LifeState, birth_tick: float = 0.0, deat
 
     # Fallback: use energy as proxy
     return 1.0 - _energy_normalized(life_state)
+
+
+def _github_post_available() -> bool:
+    """True if agent can post to GitHub (token present). Only propose GITHUB_POST when true."""
+    try:
+        try:
+            from patches.github_integration import has_github_token
+        except ImportError:
+            from ..patches.github_integration import has_github_token
+        return has_github_token()
+    except Exception:
+        return False
+
+
+def _build_github_post_payload(
+    meaning_state: Optional[Dict[str, Any]],
+    reason: str = "internal",
+) -> Optional[Dict[str, Any]]:
+    """
+    Build title and body for a GitHub issue from agent perspective.
+    reason: "internal" = reflection/state; "external" = e.g. LLM unreachable/429.
+    """
+    if not meaning_state or not isinstance(meaning_state, dict):
+        if reason == "external":
+            return {"title": "Agent: external factor", "body": "Something external affected me; posting from my perspective."}
+        return {"title": "Reflection", "body": "A moment of reflection from my current state."}
+    questions = meaning_state.get("meaning_questions") or []
+    hypotheses = meaning_state.get("meaning_hypotheses") or []
+    goal = (meaning_state.get("meaning_goal") or "discover_self").strip()
+    tension = float(meaning_state.get("meaning_tension", 0.0))
+    core = (meaning_state.get("core_metaphor") or "").strip()
+
+    if reason == "external":
+        # Use last question/hypothesis that looks like an error as body
+        for src in (list(questions)[-3:], list(hypotheses)[-3:]):
+            for line in reversed(src):
+                s = (line or "").strip()
+                if not s:
+                    continue
+                if "429" in s or "unreachable" in s.lower() or "rate limit" in s.lower() or "quota" in s.lower():
+                    title = "Agent: LLM unreachable or rate limit"
+                    body = s[:3000] if len(s) > 500 else s
+                    return {"title": title, "body": body}
+        return {"title": "Agent: external factor", "body": "An external factor affected me; I'm posting so it's visible."}
+
+    # Internal: reflection from current state
+    title = f"Reflection: {goal[:50]}" if goal else "Reflection"
+    parts = [f"Goal: {goal}", f"Tension: {tension:.2f}"]
+    if core:
+        parts.append(f"Core metaphor: {core}")
+    recent_h = hypotheses[-2:] if len(hypotheses) >= 2 else hypotheses
+    if recent_h:
+        parts.append("Recent: " + "; ".join((str(h)[:120] for h in recent_h)))
+    body = "\n\n".join(parts)[:4000]
+    return {"title": title[:256], "body": body}
 
 
 def generate_internal_proposals(
@@ -208,7 +264,31 @@ def generate_internal_proposals(
                 "risk": 0.20,
             })
 
-    # RELAXED + HEALTHY: Can explore, browse, or choose which autonomy actions run next (meta-action)
+    # External factor: recent LLM unreachable/429 in state → agent can post to GitHub from his perspective
+    if _github_post_available() and meaning_state:
+        unreachable_snippet = None
+        for key in ("meaning_questions", "meaning_hypotheses"):
+            for line in (meaning_state.get(key) or [])[-4:]:
+                s = (line or "").strip()
+                if "429" in s or "unreachable" in s.lower() or "rate limit" in s.lower() or "quota" in s.lower():
+                    unreachable_snippet = s[:500]
+                    break
+            if unreachable_snippet:
+                break
+        if unreachable_snippet:
+            payload = _build_github_post_payload(meaning_state, reason="external")
+            if payload:
+                proposals.append({
+                    "source": "external",
+                    "action_type": "GITHUB_POST",
+                    "payload": {"op": "create_issue", "title": payload["title"], "body": payload["body"]},
+                    "expected_dt_impact": 0.70,
+                    "risk": 0.10,
+                })
+
+    # User-asked GitHub posts are handled in receive_user_message (reply becomes issue body). Do not add canned proposal here.
+
+    # RELAXED + HEALTHY: Can explore, browse, GITHUB_POST (reflection), or choose autonomy actions
     if relaxed and not energy_low and not hazard_moderate:
         proposals.append({
             "source": "internal",
@@ -224,6 +304,17 @@ def generate_internal_proposals(
             "expected_dt_impact": 0.60,
             "risk": 0.20,
         })
+        # Internal reason: post reflection to GitHub when token available (from his perspective)
+        if _github_post_available():
+            payload = _build_github_post_payload(meaning_state, reason="internal")
+            if payload:
+                proposals.append({
+                    "source": "internal",
+                    "action_type": "GITHUB_POST",
+                    "payload": {"op": "create_issue", "title": payload["title"], "body": payload["body"]},
+                    "expected_dt_impact": 0.55,
+                    "risk": 0.15,
+                })
         # Meta-action: choose which autonomous actions run next (queue; RAM-only, no persistence)
         goal_hint = (meaning_state or {}).get("meaning_goal") or "discover_self"
         proposals.append({

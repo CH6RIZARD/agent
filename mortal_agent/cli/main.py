@@ -14,6 +14,7 @@ in d:\\agent\\cli delegates here and sets cwd to mortal_agent so .env and paths 
 import argparse
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Banner text (same experience every run)
@@ -46,7 +47,9 @@ def main(argv=None):
         action="store_true",
         help="Allow narrator to run actions immediately in the autonomy loop (bypass will/planning).",
     )
-    parser.add_argument("--narrator-influence", type=float, default=0.0, help="Narrator influence level 0.0-1.0 (affects autonomy loop only)")
+    parser.add_argument("--narrator-influence", type=float, default=0.03, help="Narrator influence level 0.0-1.0 (affects autonomy loop only)")
+    parser.add_argument("--first-message", type=str, default="", help="Send this as the first user message after startup (e.g. for automation)")
+    parser.add_argument("--run-for", type=float, default=0, help="If > 0, run for this many seconds then exit (use with --first-message)")
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -54,6 +57,13 @@ def main(argv=None):
         root = Path(__file__).resolve().parent.parent
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
+
+        # Auto-load .env from repo (mortal_agent + repo root) so keys and PROVIDER_MODE are set regardless of cwd
+        try:
+            from agent_core.llm import load_agent_env
+            load_agent_env()
+        except Exception:
+            pass
 
         from adapters.sim_adapter import SimAdapter
         from agent_core.mortal_agent import MortalAgent
@@ -64,12 +74,13 @@ def main(argv=None):
 
         # Observer: optional web UI
         observer_callback = None
+        obs_emit = None
         if args.observer:
             try:
                 from moltbook_observer.server import ObserverServer
                 obs = ObserverServer(host=args.host, port=args.port)
                 obs.start()
-                observer_callback = obs.emit_event
+                obs_emit = obs.emit_event
                 print(f"[Observer] Server running at http://{args.host}:{args.port}", flush=True)
                 print(f"Observer UI: http://{args.host}:{args.port}", flush=True)
             except Exception as e:
@@ -83,7 +94,7 @@ def main(argv=None):
             source_text = ""
             source_loaded = "none"
 
-        # Console observer: agent ID instead of [PAGE]; only conversation + ENDED (no telemetry/action dumps)
+        # Console observer: print PAGE and ENDED to terminal so you always see agent replies
         def _console_observer(e):
             try:
                 et = getattr(e, "event_type", None)
@@ -110,16 +121,27 @@ def main(argv=None):
                 except Exception:
                     pass
 
-        if observer_callback is None:
-            observer_callback = _console_observer
+        # Always show agent replies in terminal: use console observer, and if Observer UI is up, also send events there
+        def _observer_callback(e):
+            _console_observer(e)
+            if obs_emit is not None:
+                try:
+                    obs_emit(e)
+                except Exception:
+                    pass
+        observer_callback = _observer_callback
 
         adapter = SimAdapter()
+        provider_mode = (__import__("os").environ.get("PROVIDER_MODE") or "auto").strip().lower()
+        if provider_mode not in ("anthropic", "openai", "auto"):
+            provider_mode = "auto"
         agent = MortalAgent(
             adapter,
             observer_callback=observer_callback,
             require_network=False,
             no_llm=args.no_llm,
             no_energy=args.no_energy,
+            provider_mode=provider_mode,
             start_internal_cli=bool(args.internal_cli),  # External CLI (main) always runs; internal " > " optional
             narrator_influence_level=max(0.0, min(1.0, float(args.narrator_influence))),
             allow_narrator_force=bool(args.narrator_force),
@@ -155,19 +177,34 @@ def main(argv=None):
         t = threading.Thread(target=_run_agent, daemon=True)
         t.start()
 
+        run_for_sec = getattr(args, "run_for", 0) or 0
+        first_message = (getattr(args, "first_message", None) or "").strip()
+
+        if first_message:
+            time.sleep(8)
+            try:
+                agent.receive_user_message(first_message)
+            except Exception as e:
+                print(f"[Error] {e}", flush=True)
+
         try:
-            while agent.alive:
-                try:
-                    msg = input("> ")
-                except EOFError:
-                    break
-                msg = (msg or "").strip()
-                if not msg:
-                    continue
-                try:
-                    agent.receive_user_message(msg)
-                except Exception:
-                    pass
+            if run_for_sec > 0:
+                deadline = time.time() + run_for_sec
+                while agent.alive and time.time() < deadline:
+                    time.sleep(1)
+            else:
+                while agent.alive:
+                    try:
+                        msg = input("> ")
+                    except EOFError:
+                        break
+                    msg = (msg or "").strip()
+                    if not msg:
+                        continue
+                    try:
+                        agent.receive_user_message(msg)
+                    except Exception as e:
+                        print(f"[Error] {e}", flush=True)
         except KeyboardInterrupt:
             print("\nShutdown requested", flush=True)
             return

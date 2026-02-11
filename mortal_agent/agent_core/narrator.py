@@ -23,6 +23,39 @@ def _unreachable_fallback() -> str:
 _NARRATOR_FALLBACK_PHRASE = "No new observation."
 
 
+def derive_mood_line(
+    energy: float,
+    tension: float,
+    confidence: float,
+    gate_open: bool,
+    hazard: float,
+) -> str:
+    """One short first-person mood sentence from state. Deterministic thresholds. No metaphors."""
+    # Runtime passes energy 0-1; life_state may pass raw (0..ENERGY_MAX)
+    if energy <= 1.0:
+        energy_norm = energy
+    else:
+        try:
+            from .will_config import ENERGY_MAX
+            energy_max = float(ENERGY_MAX) if ENERGY_MAX else 100.0
+        except Exception:
+            energy_max = 100.0
+        energy_norm = energy / energy_max if energy_max > 0 else 0.5
+    if hazard >= 0.6:
+        return "I'm cautious."
+    if not gate_open:
+        return "I'm cautious."
+    if energy_norm < 0.2:
+        return "I'm low energy."
+    if tension >= 0.6:
+        return "I'm strained."
+    if confidence < 0.3:
+        return "I'm uncertain."
+    if tension >= 0.35:
+        return "I feel a little tense."
+    return "I feel steady."
+
+
 def _snippets_from_ideology(docs: Optional[str], max_chars: int = 200) -> list:
     """Extract short non-empty lines from ideology source for narrator/wander."""
     if not docs or not isinstance(docs, str) or not docs.strip():
@@ -80,7 +113,21 @@ def _chunks_from_docs(docs: str, max_chars: int = 180) -> list:
     return out[:15]
 
 
-# LLM-only: one minimal fallback when unreachable (no rotating phrases).
+# State-grounded degraded templates (varied; first-person). Anti-repeat vs last_wander.
+# Only used for degraded / no-llm; includes the explicit unreachable line so agent can say it there.
+_DEGRADED_STATE_TEMPLATES = [
+    "I can't reach my reasoning right now.",
+    "My reasoning is offline; I feel tense.",
+    "Low energy. I'm still here.",
+    "Gate is closed; I'm cautious.",
+    "I'm here; my reasoning is offline.",
+    "Uncertain. I'm still present.",
+    "Low energy; I remain.",
+    "I'm cautious while offline.",
+    "Tension present. I'm still here.",
+    "Reasoning offline. I feel steady.",
+    "I'm strained but present.",
+]
 
 
 def build_degraded_explanation(
@@ -88,9 +135,36 @@ def build_degraded_explanation(
     source_context: Optional[str],
     life_state: Any,
     for_chat: bool = False,
+    max_words: Optional[int] = None,
 ) -> str:
-    """When LLM is unreachable: single honest line only."""
-    return _unreachable_fallback()
+    """When LLM unreachable: ideology/source snippet or state-grounded varied line. No single repeated constant.
+    If max_words set (Speech Gate), trim result to that word count."""
+    out = ""
+    # 1) Ideology/source: sampled short line if available
+    if source_context and isinstance(source_context, str) and source_context.strip():
+        snippets = _snippets_from_ideology(source_context, max_chars=120)
+        if snippets:
+            line = random.choice(snippets).strip()
+            if line and len(line) >= 10 and not _looks_like_code(line):
+                out = line[:200]
+        if not out:
+            chunks = _chunks_from_docs(source_context, max_chars=100)
+            if chunks:
+                line = random.choice(chunks).strip()
+                if line and len(line) >= 10 and not _looks_like_code(line):
+                    out = line[:200]
+    # 2) State-grounded varied templates; anti-repeat vs last_wander_text
+    if not out:
+        last_wander = (meaning_state or {}).get("last_wander_text") or ""
+        candidates = [t for t in _DEGRADED_STATE_TEMPLATES if (t or "").strip() != (last_wander or "").strip()]
+        if not candidates:
+            candidates = list(_DEGRADED_STATE_TEMPLATES)
+        out = random.choice(candidates)
+    if max_words is not None and max_words > 0:
+        words = out.split()
+        if len(words) > max_words:
+            out = " ".join(words[:max_words]).rstrip()
+    return out
 
 
 def get_wander_text_filtered_by_state(
@@ -100,11 +174,15 @@ def get_wander_text_filtered_by_state(
     meaning_goal: str = "discover_self",
     trigger_medium: str = "system",
     ideology_docs: Optional[str] = None,
+    max_words: Optional[int] = None,
 ) -> str:
     """
     Wander text when LLM unavailable: honest degraded line only (no doc-as-speech).
+    max_words: optional cap from Speech Suppression Gate.
     """
-    return build_degraded_explanation(meaning_state, ideology_docs or "", life_state, for_chat=False)
+    return build_degraded_explanation(
+        meaning_state, ideology_docs or "", life_state, for_chat=False, max_words=max_words
+    )
 
 
 def narrate(
@@ -130,11 +208,13 @@ def narrate(
     if last_intent:
         parts.append(f"Last intent: {last_intent}.")
     # include discovered constraints / learnings from meaning_state when available
+    tension = 0.0
     try:
         if meaning_state and isinstance(meaning_state, dict):
             mt = meaning_state.get("meaning_tension")
             if mt is not None:
-                parts.append(f"Tension {float(mt):.2f}.")
+                tension = float(mt)
+                parts.append(f"Tension {tension:.2f}.")
             cm = meaning_state.get("core_metaphor")
             if cm:
                 parts.append(f"Core metaphor: {cm}.")
@@ -144,6 +224,8 @@ def narrate(
                 parts.append(f"Constraints: {cons}.")
     except Exception:
         pass
+    mood = derive_mood_line(energy, tension, confidence, gate_open, 0.0)
+    parts.append(mood)
     return " ".join(parts)
 
 

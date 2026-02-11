@@ -13,10 +13,12 @@ Offline wander mode: when LLM is unavailable (--no-llm or provider failure), the
 continues with deterministic doctrine-driven wander behavior. No stalling, no error spam.
 """
 
+import os
+import random
 import re
 import time
 from pathlib import Path
-from typing import Optional, Callable, Any, Dict
+from typing import Optional, Callable, Any, Dict, List
 from .runtime_state import RuntimeState
 from .planner import (
     PlanResult,
@@ -27,6 +29,8 @@ from .planner import (
     CONFIDENCE_QUICK_CHECK,
 )
 from .narrator import narrate, generate_narrator_bias, generate_narrator_proposal
+from .speech_gate import speech_suppression_gate, GateResult
+from .output_medium import OUTPUT_MEDIUM_DEFAULT
 import json
 
 try:
@@ -125,11 +129,14 @@ def propose_fetch_or_search_from_environment(
     source_context: Optional[str] = None,
     meaning_state: Optional[Dict[str, Any]] = None,
     internal_summary: Optional[str] = None,
+    recent_autonomous_actions: Optional[List[Dict[str, Any]]] = None,
+    last_autonomous_action: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     LLM scan of internal and external environment → one FETCH_URL, SEARCH_QUERY, or NONE.
     No hardcoded URLs or queries. Used for birth, silence, explore fallback, and planner seed.
-    Returns same shape as _propose_autonomy_fetch: {"action_type": "NET_FETCH"|"WEB_SEARCH", "payload": {...}} or None.
+    recent_autonomous_actions / last_autonomous_action: used to avoid repeating the same query/URL
+    and to compound (follow-up or new angle). Returns same shape as _propose_autonomy_fetch.
     """
     try:
         from .llm_router import generate_reply_routed
@@ -162,11 +169,32 @@ def propose_fetch_or_search_from_environment(
         "- Internal: " + internal + "\n"
         "- External (excerpt): " + external[:800] + "\n\n"
     )
+    # Inject recent autonomous actions so the LLM diversifies and compounds instead of repeating
+    recent_list = list(recent_autonomous_actions or [])
+    if last_autonomous_action and last_autonomous_action not in recent_list:
+        recent_list = recent_list + [last_autonomous_action]
+    if recent_list:
+        lines = []
+        for a in recent_list[-8:]:  # last 8 to avoid token bloat
+            if isinstance(a, dict):
+                if a.get("action") == "WEB_SEARCH" and a.get("query"):
+                    lines.append("WEB_SEARCH: " + (a.get("query", "")[:100]))
+                elif a.get("action") == "NET_FETCH" and a.get("url"):
+                    lines.append("NET_FETCH: " + (a.get("url", "")[:120]))
+        if lines:
+            meaning_context += (
+                "**Recent autonomous actions (do NOT repeat the same query or URL; "
+                "choose a different angle, a follow-up from results, or a new interest):**\n- "
+                + "\n- ".join(lines) + "\n\n"
+            )
     prompt = prompt.replace("{{meaning_context}}", meaning_context)
     system = "You output exactly one line: FETCH_URL: <url> or SEARCH_QUERY: <query> or NONE. No other text. No example.com or example domains."
+    _pm = (os.environ.get("PROVIDER_MODE") or "auto").strip().lower()
+    if _pm not in ("anthropic", "openai", "auto"):
+        _pm = "auto"
     reply, _ = generate_reply_routed(
         prompt, system, max_tokens=120, source_context=source_context,
-        provider_mode="auto", timeout_s=30.0, retries=2, failover=True, no_llm=False,
+        provider_mode=_pm, timeout_s=30.0, retries=2, failover=True, no_llm=False,
     )
     if not reply:
         return None
@@ -236,9 +264,12 @@ def _propose_autonomy_fetch(
         meaning_context = "**Recent context (use this to choose follow-up search or fetch):**\n- " + "\n- ".join(parts) + "\n\n"
     prompt = prompt.replace("{{meaning_context}}", meaning_context)
     system = "You output exactly one line: FETCH_URL: <url> or SEARCH_QUERY: <query> or NONE. No other text."
+    _pm = (os.environ.get("PROVIDER_MODE") or "auto").strip().lower()
+    if _pm not in ("anthropic", "openai", "auto"):
+        _pm = "auto"
     reply, _ = generate_reply_routed(
         prompt, system, max_tokens=120, source_context=source_context,
-        provider_mode="auto", timeout_s=30.0, retries=2, failover=True, no_llm=False,
+        provider_mode=_pm, timeout_s=30.0, retries=2, failover=True, no_llm=False,
     )
     if not reply:
         return None
@@ -309,28 +340,84 @@ def decide(
     return default_action_fn()
 
 
+def _autonomy_gate(
+    runtime: RuntimeState,
+    life_state: Optional["LifeState"],
+    meaning_state: Optional[Dict[str, Any]],
+    last_post_tick: float,
+    delta_t: float,
+    output_medium: str = OUTPUT_MEDIUM_DEFAULT,
+    loop_trigger: Optional[str] = None,
+) -> GateResult:
+    """Build internal_state and narrator_context; run Speech Suppression Gate."""
+    try:
+        energy = getattr(life_state, "energy", runtime.energy if runtime else 0.7)
+        if energy > 1.0:
+            try:
+                from .will_config import ENERGY_MAX
+                energy_norm = energy / (float(ENERGY_MAX or 100.0))
+            except Exception:
+                energy_norm = 0.5
+        else:
+            energy_norm = energy
+        tension = float((meaning_state or {}).get("meaning_tension", 0.0))
+        uncertainty = 1.0 - (runtime.confidence if runtime else 0.7)
+        internal_state = {
+            "energy": energy_norm,
+            "tension": tension,
+            "uncertainty": uncertainty,
+            "last_spoke_ts": last_post_tick,
+            "now_ts": delta_t,
+        }
+        narrator_context = {
+            "last_energy": (meaning_state or {}).get("last_gate_energy"),
+            "last_tension": (meaning_state or {}).get("last_gate_tension"),
+            "last_uncertainty": (meaning_state or {}).get("last_gate_uncertainty"),
+        }
+        return speech_suppression_gate(
+            internal_state,
+            narrator_context,
+            output_medium,
+            explicit_user_prompt=False,
+            time_critical=False,
+            loop_trigger=loop_trigger,
+        )
+    except Exception:
+        return GateResult(should_speak=True, speak_reason="gate_error", max_words=60, style_profile="compressed_philosopher")
+
+
 def _get_offline_wander_text(
     life_state: Optional["LifeState"],
     meaning_state: Optional[Dict[str, Any]] = None,
     source_context: Optional[str] = None,
+    max_words: Optional[int] = None,
 ) -> str:
     """
-    When LLM is unavailable: route to docs + state and build coherent explanation.
-    Nothing hardcoded. Use state whenever meaning_state is available (source_context can be empty).
+    When LLM unavailable: (1) ideology/source snippet (2) source snippet (3) state template (4) unreachable.
+    Uses narrator for ideology/source/state; llm_router pool as last resort. Anti-repeat via last_wander_text.
+    max_words: optional cap from Speech Suppression Gate.
     """
-    if meaning_state is not None:
-        try:
-            from .narrator import build_degraded_explanation
-            return build_degraded_explanation(meaning_state, source_context or "", life_state)
-        except Exception:
-            pass
+    try:
+        from .narrator import build_degraded_explanation
+        out = build_degraded_explanation(meaning_state, source_context or "", life_state, max_words=max_words)
+        if out and (out or "").strip():
+            return out
+    except Exception:
+        pass
     try:
         from .llm_router import get_offline_wander_text
         energy = life_state.energy if life_state else 100.0
         hazard = life_state.hazard_score if life_state else 0.0
-        return get_offline_wander_text(energy, hazard)
+        last_text = (meaning_state or {}).get("last_wander_text") if meaning_state else None
+        out = get_offline_wander_text(energy, hazard, last_text=last_text)
+        if max_words and out:
+            words = out.split()
+            if len(words) > max_words:
+                out = " ".join(words[:max_words]).rstrip()
+        return out
     except ImportError:
-        return ""
+        pass
+    return "I can't reach my reasoning right now."
 
 
 def _wrap_autonomous_text(text: str) -> str:
@@ -343,6 +430,29 @@ def _wrap_autonomous_text(text: str) -> str:
     if not t.endswith("..."):
         t = t + "..."
     return t
+
+
+def _wander_feed_cognition(
+    wander_text: str,
+    state_update_fn: Optional[Callable[[dict], None]],
+) -> None:
+    """
+    Wander feeds cognition: perturb internal state, seed narrator memory.
+    Called after any wander post so narrator/planner can observe wander.
+    """
+    if not wander_text or not (wander_text or "").strip():
+        return
+    if not state_update_fn:
+        return
+    try:
+        t = (wander_text or "").strip()
+        payload = {
+            "meaning_hypotheses_append": t[:200],
+            "last_wander_text": t[:300],
+        }
+        state_update_fn(payload)
+    except Exception:
+        pass
 
 
 def run_autonomy_tick(
@@ -400,34 +510,63 @@ def run_autonomy_tick(
     if runtime.depleted():
         return (last_post, last_intent_out)
 
-    # Offline wander mode: deterministic doctrine-driven behavior
+    # Wander heartbeat (always on): runs on timer regardless of LLM state. No double-post: respect post cooldown.
+    last_wander_tick = getattr(life_kernel, "last_wander_tick", 0.0) if life_kernel else 0.0
+    wander_due = (delta_t - last_wander_tick) >= WANDER_INTERVAL
+    if wander_due and now >= runtime.post_cooldown_until:
+        gate_result = _autonomy_gate(runtime, life_state, meaning_state, last_post, delta_t, OUTPUT_MEDIUM_DEFAULT, loop_trigger="wander")
+        if not gate_result.should_speak:
+            pass  # skip wander this tick (suppression)
+        elif runtime.can_speak() and runtime.spend_speech():
+            wander_text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context, max_words=gate_result.max_words)
+            # When LLM on, do not post lines that say reasoning is offline (avoid contradiction).
+            if no_llm:
+                allow_post = True
+            else:
+                allow_post = not _is_unreachable_fallback(wander_text) and "offline" not in (wander_text or "").lower()
+            if wander_text and len(wander_text) >= 10 and allow_post:
+                if commit_begin("wander"):
+                    try:
+                        result = executor_execute_fn(instance_id, [
+                            {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(wander_text), "channel": "moltbook"}},
+                        ])
+                        if result.get("published", 0) > 0:
+                            last_post = delta_t
+                            last_intent_out = "wander"
+                            runtime.request_post_cooldown(post_cooldown_seconds)
+                            runtime.request_speech_cooldown(5.0)
+                            if life_kernel:
+                                life_kernel.last_wander_tick = delta_t
+                                life_kernel.set_last_action("wander")
+                            _ledger("PUBLISH_POST", "wander", "no_post", "executed", "low")
+                            if record_last_autonomous_message_fn and wander_text:
+                                try:
+                                    record_last_autonomous_message_fn((wander_text or "").strip()[:200])
+                                except Exception:
+                                    pass
+                            _wander_feed_cognition(wander_text, state_update_fn)
+                            # Feed gate state for next tick state_delta
+                            try:
+                                if state_update_fn and life_state is not None:
+                                    e = getattr(life_state, "energy", 0.5)
+                                    if e > 1.0:
+                                        try:
+                                            from .will_config import ENERGY_MAX
+                                            e = e / (float(ENERGY_MAX or 100.0))
+                                        except Exception:
+                                            e = 0.5
+                                    state_update_fn({
+                                        "last_gate_energy": e,
+                                        "last_gate_tension": float((meaning_state or {}).get("meaning_tension", 0.0)),
+                                        "last_gate_uncertainty": 1.0 - runtime.confidence,
+                                    })
+                            except Exception:
+                                pass
+                    finally:
+                        commit_end()
+
+    # Offline mode: wander heartbeat above is the only autonomous output path; will/planner not used.
     if no_llm:
-        last_wander_tick = getattr(life_kernel, "last_wander_tick", 0.0) if life_kernel else 0.0
-        if (delta_t - last_wander_tick) >= WANDER_INTERVAL:
-            if runtime.can_speak() and runtime.spend_speech():
-                wander_text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context)
-                if wander_text and len(wander_text) >= 20:
-                    if commit_begin("wander"):
-                        try:
-                            result = executor_execute_fn(instance_id, [
-                                {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(wander_text), "channel": "moltbook"}},
-                            ])
-                            if result.get("published", 0) > 0:
-                                last_post = delta_t
-                                last_intent_out = "wander"
-                                runtime.request_post_cooldown(post_cooldown_seconds)
-                                runtime.request_speech_cooldown(5.0)
-                                if life_kernel:
-                                    life_kernel.last_wander_tick = delta_t
-                                    life_kernel.set_last_action("wander")
-                                _ledger("PUBLISH_POST", "wander", "no_post", "executed", "low")
-                                if record_last_autonomous_message_fn and wander_text:
-                                    try:
-                                        record_last_autonomous_message_fn((wander_text or "").strip()[:200])
-                                    except Exception:
-                                        pass
-                        finally:
-                            commit_end()
         return (last_post, last_intent_out)
 
     if life_state and select_action and generate_internal_proposals:
@@ -786,6 +925,15 @@ def run_autonomy_tick(
                     ok = res and (res.get("published", 0) > 0 or not (res.get("errors") or []))
                     _ledger(action_type, "autonomy", "passthrough", "executed" if ok else "error", "low")
                     last_intent_out = action_type
+                    # Wire GITHUB_POST result into agent state so reply reflects actual outcome (patch 2).
+                    if action_type == "GITHUB_POST" and state_update_fn and res:
+                        gh = res.get("last_github_result")
+                        if gh is not None:
+                            summary = gh if isinstance(gh, str) else (gh.get("github_result_summary") or gh.get("error") or str(gh)[:200])
+                            try:
+                                state_update_fn({"last_github_result": summary[:300]})
+                            except Exception:
+                                pass
                 # Homeostasis expression: doctrine-driven natural text (textforge)
                 elif textforge and life_kernel and life_state:
                     try:
@@ -822,12 +970,16 @@ def run_autonomy_tick(
                                 debug_mode=debug_mode,
                                 max_attempts=3,
                             )
-                            if passed and candidate and runtime.can_speak() and runtime.spend_speech():
+                            gate_homeo = _autonomy_gate(runtime, life_state, meaning_state, last_post, delta_t, OUTPUT_MEDIUM_DEFAULT, loop_trigger="homeostasis_expression")
+                            if gate_homeo.should_speak and passed and candidate and runtime.can_speak() and runtime.spend_speech():
+                                ctext = candidate
+                                if gate_homeo.max_words and len(ctext.split()) > gate_homeo.max_words:
+                                    ctext = " ".join(ctext.split()[: gate_homeo.max_words]).rstrip()
                                 result = executor_execute_fn(instance_id, [
-                                    {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(candidate), "channel": "moltbook"}},
+                                    {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(ctext), "channel": "moltbook"}},
                                 ])
                                 if result.get("published", 0) > 0:
-                                    text = candidate
+                                    text = ctext
                                     outbox_sent = True
                                     last_post = delta_t
                                     last_intent_out = action_type or "homeostasis_expression"
@@ -839,7 +991,7 @@ def run_autonomy_tick(
                                     life_kernel.textforge_archetype_index = archetype_gen._index
                                     life_kernel.textforge_last_archetype = archetype_gen._last_archetype or ""
                                     life_kernel.textforge_rng_counter = state.rng_counter
-                                    natural_filter.add_sent(candidate)
+                                    natural_filter.add_sent(ctext)
                             if not outbox_sent and observer_emit:
                                 observer_emit(ActionEvent(
                                     instance_id, delta_t, "homeostasis_expression", False, reason or "filter",
@@ -864,6 +1016,40 @@ def run_autonomy_tick(
 
     if not should_consider_post(runtime, last_post, delta_t, now):
         return (last_post, last_intent_out)
+
+    # Narrator sometimes speaks without prompting a plan: observation / reflection, not justification.
+    if life_state and meaning_state is not None and random.random() < (0.1 + 0.15 * min(1.0, float(narrator_influence_level or 0))):
+        gate_result_obs = _autonomy_gate(runtime, life_state, meaning_state, last_post, delta_t, OUTPUT_MEDIUM_DEFAULT, loop_trigger="narrator_observation")
+        if gate_result_obs.should_speak:
+            try:
+                np = generate_narrator_proposal(
+                    life_state, meaning_state, delta_t, last_intent, narrator_influence_level, source_context=source_context,
+                )
+                if np and (np.get("action_type") or "").strip() == "PUBLISH_POST":
+                    text = ((np.get("payload") or {}).get("text") or "").strip()
+                    if text and runtime.can_speak() and runtime.spend_speech():
+                        if gate_result_obs.max_words and len(text.split()) > gate_result_obs.max_words:
+                            text = " ".join(text.split()[: gate_result_obs.max_words]).rstrip()
+                        if commit_begin("narrator_observation"):
+                            try:
+                                result = executor_execute_fn(instance_id, [
+                                    {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(text), "channel": "moltbook"}},
+                                ])
+                                if result.get("published", 0) > 0:
+                                    last_post = delta_t
+                                    last_intent_out = "narrator_observation"
+                                    runtime.request_post_cooldown(post_cooldown_seconds)
+                                    runtime.request_speech_cooldown(5.0)
+                                    if life_kernel:
+                                        life_kernel.set_last_action("narrator_observation")
+                                    if record_last_autonomous_message_fn:
+                                        record_last_autonomous_message_fn(text[:200])
+                                    _wander_feed_cognition(text, state_update_fn)
+                            finally:
+                                commit_end()
+                            return (last_post, last_intent_out)
+            except Exception:
+                pass
 
     narrator_context = narrate(
         instance_id, delta_t, runtime.energy, runtime.confidence,
@@ -895,6 +1081,10 @@ def run_autonomy_tick(
             dilemma = ". ".join(parts)[:400]
             if dilemma:
                 narrator_context = narrator_context + " [Your state of mind and dilemma—you are this instance, continuity is finite, act in light of: " + dilemma + "]"
+            # Narrator observes wander: recent wander output feeds identity drift and reflection.
+            lwt = (meaning_state or {}).get("last_wander_text")
+            if lwt and isinstance(lwt, str) and lwt.strip():
+                narrator_context = narrator_context + " [Last wander: " + (lwt.strip()[:150]) + "]"
     except Exception:
         pass
     plan = decide(
@@ -906,10 +1096,13 @@ def run_autonomy_tick(
         narrator_context=narrator_context,
     )
 
-    # If LLM returned None (failure), fall back to wander. One identity: never post "I can't reason" from autonomy.
+    # If LLM returned None (failure), fall back to wander. Varied text; suppress only if duplicate of last post.
     if plan is None or (not plan.text and not plan.intent):
-        wander_text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context)
-        if wander_text and not _is_unreachable_fallback(wander_text) and runtime.can_speak() and runtime.spend_speech():
+        gate_fb = _autonomy_gate(runtime, life_state, meaning_state, last_post, delta_t, OUTPUT_MEDIUM_DEFAULT, loop_trigger="wander_fallback")
+        wander_text = _get_offline_wander_text(life_state, meaning_state=meaning_state, source_context=source_context, max_words=gate_fb.max_words) if gate_fb.should_speak else ""
+        last_posted = ((meaning_state or {}).get("last_wander_text") or "").strip()
+        not_duplicate = (wander_text or "").strip() != last_posted
+        if gate_fb.should_speak and wander_text and not_duplicate and runtime.can_speak() and runtime.spend_speech():
             if commit_begin("wander_fallback"):
                 try:
                     result = executor_execute_fn(instance_id, [
@@ -922,17 +1115,12 @@ def run_autonomy_tick(
                         runtime.request_speech_cooldown(5.0)
                         if life_kernel:
                             life_kernel.set_last_action("wander")
-                        if state_update_fn and wander_text:
-                            try:
-                                t = (wander_text or "").strip()[:200]
-                                state_update_fn({"meaning_hypotheses_append": t})
-                            except Exception:
-                                pass
                         if record_last_autonomous_message_fn and wander_text:
                             try:
                                 record_last_autonomous_message_fn((wander_text or "").strip()[:200])
                             except Exception:
                                 pass
+                        _wander_feed_cognition(wander_text, state_update_fn)
                 finally:
                     commit_end()
         return (last_post, last_intent_out)
@@ -949,17 +1137,26 @@ def run_autonomy_tick(
     if not plan.should_post(effective_threshold):
         return (last_post, last_intent_out)
 
+    gate_result = _autonomy_gate(runtime, life_state, meaning_state, last_post, delta_t, OUTPUT_MEDIUM_DEFAULT, loop_trigger="post")
+    if not gate_result.should_speak:
+        return (last_post, last_intent_out)
+
     if not runtime.can_speak():
         return (last_post, last_intent_out)
 
     if not runtime.spend_speech():
         return (last_post, last_intent_out)
 
+    # Enforce max_words from gate (compressed_philosopher cap)
+    plan_text = (plan.text or "").strip()
+    if gate_result.max_words and len(plan_text.split()) > gate_result.max_words:
+        plan_text = " ".join(plan_text.split()[: gate_result.max_words]).rstrip()
+
     if not commit_begin("post"):
         return (last_post, last_intent_out)
     try:
         result = executor_execute_fn(instance_id, [
-            {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(plan.text), "channel": "moltbook"}},
+            {"action": "PUBLISH_POST", "args": {"text": _wrap_autonomous_text(plan_text), "channel": "moltbook"}},
         ])
         if result.get("published", 0) > 0:
             last_post = delta_t
@@ -967,15 +1164,26 @@ def run_autonomy_tick(
             runtime.request_post_cooldown(post_cooldown_seconds)
             runtime.request_speech_cooldown(5.0)
             _ledger("PUBLISH_POST", "autonomy", "no_post", "executed", "low")
-            if state_update_fn and plan.text and (plan.text or "").strip():
+            if state_update_fn and plan_text:
                 try:
-                    t = (plan.text or "").strip()[:200]
-                    state_update_fn({"meaning_hypotheses_append": t})
+                    payload = {"meaning_hypotheses_append": plan_text[:200]}
+                    if life_state is not None:
+                        e = getattr(life_state, "energy", 0.5)
+                        if e > 1.0:
+                            try:
+                                from .will_config import ENERGY_MAX
+                                e = e / (float(ENERGY_MAX or 100.0))
+                            except Exception:
+                                e = 0.5
+                        payload["last_gate_energy"] = e
+                        payload["last_gate_tension"] = float((meaning_state or {}).get("meaning_tension", 0.0))
+                        payload["last_gate_uncertainty"] = 1.0 - runtime.confidence
+                    state_update_fn(payload)
                 except Exception:
                     pass
-            if record_last_autonomous_message_fn and plan.text and (plan.text or "").strip():
+            if record_last_autonomous_message_fn and plan_text:
                 try:
-                    record_last_autonomous_message_fn((plan.text or "").strip()[:200])
+                    record_last_autonomous_message_fn(plan_text[:200])
                 except Exception:
                     pass
         else:

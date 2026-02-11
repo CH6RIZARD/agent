@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 
 def main():
+    print("[llm_smoke_test] Starting...", flush=True)
     try:
         from agent_core.llm_router import generate_reply_routed
     except ImportError as e:
@@ -38,12 +39,14 @@ def main():
         print(f"latency_s: {elapsed:.2f}")
         if failure:
             print(f"error: {failure.get('detail', '')[:200]}")
+        print(flush=True)
         return 1
 
     first_200 = (reply or "")[:200]
     print("provider: (success; Claude first, then OpenRouter/OpenAI)")
     print(f"response (first 200 chars): {first_200!r}")
     print(f"latency_s: {elapsed:.2f}")
+    print(flush=True)
     return 0
 
 
