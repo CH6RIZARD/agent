@@ -368,6 +368,7 @@ class MortalAgent:
         self._birth_action_log = {}
         self._last_autonomous_action = None  # {"action": "WEB_SEARCH"|"NET_FETCH", "query"|"url": str} for chat context
         self._recent_autonomous_actions = []  # last N (e.g. 10) for diversify/compound; entries like _last_autonomous_action
+        self._recent_web_searches: list = []  # last N {"query", "retained"} for narrator state; RAM only; influences thought/action
         self._last_silence_entropy_check = 0.0
         self._last_meaning_reflection_tick = 0.0
         self._last_identity_refresh_tick = 0.0
@@ -402,6 +403,7 @@ class MortalAgent:
     SILENCE_ENTROPY_INTERVAL = 25.0
     MEANING_REFLECTION_INTERVAL = 60.0   # run reflection at most every this many delta_t seconds
     MEANING_REFLECTION_TENSION_THRESHOLD = 0.5  # or when meaning_tension exceeds this
+    RECENT_WEB_SEARCHES_MAX = 10  # cap on _recent_web_searches so narrator state stays bounded
 
     def _entropy_birth(self) -> float:
         """Environment entropy at birth: no memory, unknown world, tools available, time advancing."""
@@ -759,23 +761,34 @@ class MortalAgent:
         return "\n".join(lines)
 
     def _ingest_search_result(self, res: Dict[str, Any]) -> None:
-        """Ingest WEB_SEARCH result into meaning_hypotheses and autonomy URL queue (follow links)."""
+        """Ingest WEB_SEARCH result into meaning_hypotheses, autonomy URL queue, and recent_web_searches (narrator state)."""
         if not isinstance(res, dict) or not res.get("executed"):
             return
         try:
             self.record_medium("web_search")
         except Exception:
             pass
+        # Build short recap of what to retain for narrator state (influences thought and action)
+        query = (res.get("query") or "").strip()[:120]
+        abstract = (res.get("abstract") or "").strip()
+        snippets = [s for s in (res.get("snippets") or []) if isinstance(s, str) and s.strip()]
+        retained_parts = [abstract[:180]] if abstract else []
+        for s in snippets[:2]:
+            retained_parts.append((s.strip())[:120])
+        retained = " ".join(retained_parts).strip()[:220] or "(no content)"
         with self._state_lock:
             hs = self._meaning_state.get("meaning_hypotheses", [])
             if len(hs) < 15:
-                abstract = (res.get("abstract") or "").strip()
                 if abstract:
                     hs.append("search: " + abstract[:400])
                 for s in (res.get("snippets") or [])[:5]:
                     if isinstance(s, str) and s.strip() and len(hs) < 15:
                         hs.append("search: " + s[:300].strip())
             self._meaning_state["meaning_hypotheses"] = hs
+            # Append to recent web searches so all searches are represented in narrator state
+            recent = getattr(self, "_recent_web_searches", [])
+            recent.append({"query": query or "?", "retained": retained})
+            self._recent_web_searches = recent[-self.RECENT_WEB_SEARCHES_MAX:]
         urls = res.get("urls") or []
         if urls:
             with self._autonomy_lock:
@@ -1563,6 +1576,16 @@ class MortalAgent:
                                 state_parts.append("Last autonomous action: WEB_SEARCH with query: %s" % (laa.get("query", "")[:120]))
                             elif act == "NET_FETCH" and laa.get("url"):
                                 state_parts.append("Last autonomous action: NET_FETCH of URL: %s" % (laa.get("url", "")[:120]))
+                        # All recent web searches and what you retained—use to inform your thoughts and actions
+                        recent_searches = getattr(self, "_recent_web_searches", [])
+                        if recent_searches:
+                            lines = []
+                            for entry in recent_searches[-5:]:
+                                q = (entry.get("query") or "?")[:60]
+                                r = (entry.get("retained") or "")[:100]
+                                lines.append("%s: %s" % (q, r))
+                            search_recap = " | ".join(lines)[:400]
+                            state_parts.append("Recent web searches (influence your thoughts and actions): " + search_recap)
                         lgr = (ms.get("last_github_result") or "").strip()
                         if lgr:
                             state_parts.append("Last GitHub post result (use this when asked if you posted): " + lgr[:280])
